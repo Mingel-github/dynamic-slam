@@ -25,6 +25,7 @@ class DynamicsMonitor(Node):
         # 速度缓存 (用于检测抽搐)
         self.vel_history = []
         
+        self.done = False
         print("\n" + "="*60)
         print("🚀 LIO-SAM 动态性能监控终端 (v3.0)")
         print("   监测重点: [三维位置] [三维速度] [Z轴抽搐]")
@@ -107,15 +108,15 @@ class DynamicsMonitor(Node):
             # 严重发散保护
             if abs(pos.z) > 5.0:
                 print("\n❌ [FATAL] 积分完全发散，停止监控。")
-                raise SystemExit
+                self.done = True
+                return
 
 def main(args=None):
     rclpy.init(args=args)
     node = DynamicsMonitor()
     try:
-        rclpy.spin(node)
-    except SystemExit:
-        pass
+        while rclpy.ok() and not node.done:
+            rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
     finally:

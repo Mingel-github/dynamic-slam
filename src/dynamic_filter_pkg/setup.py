@@ -4,6 +4,13 @@ from setuptools import find_packages, setup
 
 package_name = 'dynamic_filter_pkg'
 
+# 使用 setup.py 所在目录作为基准，确保 colcon build 时 cwd 变化不影响 glob 结果
+_pkg_root = os.path.dirname(os.path.abspath(__file__))
+_weights_dir = os.path.join(_pkg_root, 'dynamic_filter_pkg', 'weights')
+_weights_abs = glob(os.path.join(_weights_dir, '*.pt'))
+# setuptools 要求 data_files 使用相对路径，转换回来
+_weights_files = [os.path.relpath(w, _pkg_root) for w in _weights_abs]
+
 setup(
     name=package_name,
     version='0.0.0',
@@ -12,8 +19,8 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        # ！！！关键：将 weights 目录下的模型文件安装到 share 目录下 ！！！
-        (os.path.join('share', package_name, 'weights'), glob('dynamic_filter_pkg/weights/*.pt')),
+        # 关键：将 weights 目录下的模型文件安装到 share 目录下
+        (os.path.join('share', package_name, 'weights'), _weights_files),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

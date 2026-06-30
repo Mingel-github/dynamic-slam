@@ -60,30 +60,36 @@ class MotionDetector:
                     # 4. 基于种子的 32FC1 深度图区域生长
                     for i, pt in enumerate(outliers):
                         x, y = int(pt[0]), int(pt[1])
-                        
+
                         # 边界安全检查
                         if x < 0 or x >= w or y < 0 or y >= h:
                             continue
-                        
+
                         # 位移标量检查：剔除由于 RANSAC 矩阵解算误差导致的微小静止外点
-                        disp = np.linalg.norm(pt - old_outliers[i])
+                        dx = float(pt[0] - old_outliers[i][0])
+                        dy = float(pt[1] - old_outliers[i][1])
+                        disp = (dx*dx + dy*dy) ** 0.5
                         if disp < self.min_displacement:
                             continue
-                            
+
                         # 剔除无效深度种子点
                         z_val = clean_depth[y, x]
                         if z_val <= 0.1:
                             continue
-                        
+
+                        # ★ 跳过已被之前种子生长过的区域，避免重复 floodFill
+                        if floodfill_mask[y+1, x+1] > 0:
+                            continue
+
                         # 执行区域生长。flags: 4邻域连通 | 掩码填充值为255 | 仅将结果输出至mask不改变原图
                         flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY
                         cv2.floodFill(
-                            clean_depth, 
-                            floodfill_mask, 
-                            (x, y), 
-                            newVal=0, 
-                            loDiff=self.depth_tolerance, 
-                            upDiff=self.depth_tolerance, 
+                            clean_depth,
+                            floodfill_mask,
+                            (x, y),
+                            newVal=0,
+                            loDiff=self.depth_tolerance,
+                            upDiff=self.depth_tolerance,
                             flags=flags
                         )
                     

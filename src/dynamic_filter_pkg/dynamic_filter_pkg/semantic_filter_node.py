@@ -27,9 +27,13 @@ class SemanticFilterNode(Node):
         
         # 1. 加载 YOLOv8 模型
         pkg_share_dir = get_package_share_directory('dynamic_filter_pkg')
-        weights_path = os.path.join(pkg_share_dir, 'weights', 'yolov8n-seg.pt') 
+        weights_path = os.path.join(pkg_share_dir, 'weights', 'yolov8n-seg.pt')
         if not os.path.exists(weights_path):
-             weights_path = os.path.join(os.getcwd(), 'src/dynamic_filter_pkg/dynamic_filter_pkg/weights/yolov8n-seg.pt')
+            self.get_logger().error(
+                f'YOLO 权重文件未找到: {weights_path}\n'
+                f'  请确认 colcon build 成功执行，且 setup.py 正确安装 weights 到 share 目录。'
+            )
+            raise FileNotFoundError(weights_path)
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.model = YOLO(weights_path)
@@ -176,7 +180,9 @@ class SemanticFilterNode(Node):
             self.track_pub.publish(marker_array)
 
         except Exception as e:
+            import traceback
             self.get_logger().error(f'Processing Error: {e}')
+            self.get_logger().error(f'Traceback:\n{traceback.format_exc()}')
 
     def create_marker(self, header, marker_type, m_id, color, scale, x, y, z, text=""):
         """Marker 辅助生成函数"""

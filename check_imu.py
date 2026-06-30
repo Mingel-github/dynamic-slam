@@ -14,6 +14,7 @@ class ImuInspector(Node):
             10)
         self.acc_z_buffer = []
         self.start_time = time.time()
+        self.done = False
         print("正在收集 200 个 IMU 数据点 (约 1-2 秒)... 请保持小车静止！")
 
     def listener_callback(self, msg):
@@ -23,7 +24,7 @@ class ImuInspector(Node):
 
         if len(self.acc_z_buffer) >= 200:
             self.analyze_and_report()
-            raise SystemExit
+            self.done = True
 
     def analyze_and_report(self):
         data = np.array(self.acc_z_buffer)
@@ -54,8 +55,12 @@ def main(args=None):
     rclpy.init(args=args)
     inspector = ImuInspector()
     try:
-        rclpy.spin(inspector)
-    except SystemExit:
+        while rclpy.ok() and not inspector.done:
+            rclpy.spin_once(inspector, timeout_sec=0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        inspector.destroy_node()
         rclpy.shutdown()
 
 if __name__ == '__main__':
