@@ -1,0 +1,207 @@
+<?xml version="1.0" ?>
+<sdf version="1.7">
+  <world name="loop_corridor_world">
+
+    <physics type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <include>
+      <uri>model://sun</uri>
+      <pose>0 0 10 0.5 0.5 0</pose>
+    </include>
+    
+    <!-- 保留基础物理地面支撑 -->
+    <include><uri>model://ground_plane</uri></include>
+
+    <model name="loop_walls">
+      <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
+
+      <!-- [新增] 铺设全局高特征点瓷砖地板 (厚度0.01m，略微悬浮以防止Z-fighting闪烁) -->
+      <link name="floor_tiles">
+        <pose>0 0 0.005 0 0 0</pose>
+        <collision name="col"><geometry><box><size>20.4 20.4 0.01</size></box></geometry></collision>
+        <visual name="vis">
+          <geometry><box><size>20.4 20.4 0.01</size></box></geometry>
+          <material>
+            <script>
+              <uri>file://media/materials/scripts/gazebo.material</uri>
+              <name>Gazebo/CeilingTiled</name>
+            </script>
+          </material>
+        </visual>
+      </link>
+
+      <link name="wall_north_inner">
+        <pose>0 6 1.5 0 0 0</pose> <collision name="col"><geometry><box><size>12.2 0.2 3</size></box></geometry></collision> <visual name="vis">
+          <geometry><box><size>12.2 0.2 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+
+      <link name="wall_south_inner">
+        <pose>0 -6 1.5 0 0 0</pose> <collision name="col"><geometry><box><size>12.2 0.2 3</size></box></geometry></collision> <visual name="vis">
+          <geometry><box><size>12.2 0.2 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/WoodFloor</name></script></material>
+        </visual>
+      </link>
+
+      <link name="wall_east_inner">
+        <pose>6 0 1.5 0 0 0</pose> <collision name="col"><geometry><box><size>0.2 12 3</size></box></geometry></collision> <visual name="vis">
+          <geometry><box><size>0.2 12 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material>
+        </visual>
+      </link>
+
+      <link name="wall_west_inner">
+        <pose>-6 0 1.5 0 0 0</pose> <collision name="col"><geometry><box><size>0.2 12 3</size></box></geometry></collision> <visual name="vis">
+          <geometry><box><size>0.2 12 3</size></box></geometry>
+          <material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Wood</name></script></material>
+        </visual>
+      </link>
+
+      <link name="wall_north_outer">
+        <pose>0 10 1.5 0 0 0</pose>
+        <collision name="col"><geometry><box><size>20.4 0.2 3</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>20.4 0.2 3</size></box></geometry><material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material></visual>
+      </link>
+      <link name="wall_south_outer">
+        <pose>0 -10 1.5 0 0 0</pose>
+        <collision name="col"><geometry><box><size>20.4 0.2 3</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>20.4 0.2 3</size></box></geometry><material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material></visual>
+      </link>
+      <link name="wall_east_outer">
+        <pose>10 0 1.5 0 0 0</pose>
+        <collision name="col"><geometry><box><size>0.2 20 3</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.2 20 3</size></box></geometry><material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material></visual>
+      </link>
+      <link name="wall_west_outer">
+        <pose>-10 0 1.5 0 0 0</pose>
+        <collision name="col"><geometry><box><size>0.2 20 3</size></box></geometry></collision>
+        <visual name="vis"><geometry><box><size>0.2 20 3</size></box></geometry><material><script><uri>file://media/materials/scripts/gazebo.material</uri><name>Gazebo/Bricks</name></script></material></visual>
+      </link>
+      
+    </model>
+
+    <!-- ==================== 东侧 & 其他区域静态障碍物 ==================== -->
+    <include>
+      <uri>model://cafe_table</uri>
+      <pose>8.5 8.5 0 0 0 0</pose>
+      <static>true</static>
+    </include>
+
+    <include>
+      <uri>model://construction_barrel</uri>
+      <pose>8.5 -8.5 0 0 0 0</pose>
+    </include>
+
+    <include>
+      <uri>model://cabinet</uri>
+      <pose>-7.5 7.5 0 0 0 1.57</pose> <static>true</static>
+    </include>
+
+    <include>
+      <uri>model://jersey_barrier</uri>
+      <pose>-8.5 -8.5 0 0 0 2.356</pose> <static>true</static>
+    </include>
+
+    <include>
+      <uri>model://dumpster</uri>
+      <pose>0 8.8 0 0 0 0</pose> 
+      <static>true</static>
+    </include>
+
+    <include>
+      <uri>model://bookshelf</uri>
+      <pose>8.8 0 0 0 0 -1.57</pose>
+      <static>true</static>
+    </include>
+
+    <include>
+      <name>cone_1</name>
+      <uri>model://construction_cone</uri>
+      <pose>-3 -8.5 0 0 0 0</pose>
+    </include>
+    <include>
+      <name>cone_2</name>
+      <uri>model://construction_cone</uri>
+      <pose>3 -8.0 0 0 0 0</pose>
+    </include>
+
+    <include>
+        <uri>model://mailbox</uri>
+        <pose>-8.5 -5 0 0 0 0</pose>
+        <static>true</static>
+    </include>
+
+    <include>
+      <uri>model://postbox</uri>
+      <pose>-4 8.8 0 0 0 0</pose>
+      <static>true</static>
+    </include>
+    <include>
+      <uri>model://fire_hydrant</uri>
+      <pose>-5 -8.5 0 0 0 0</pose>
+      <static>true</static>
+    </include>
+
+    <!-- ==================== [新增] 西侧走廊核心静态锚点 ==================== -->
+    <!-- 紧靠西侧外墙 (-9.2)，位于走廊中段，为 RANSAC 提供强大的背景支撑 -->
+    
+    <include>
+      <name>west_bookshelf_anchor</name>
+      <uri>model://bookshelf</uri>
+      <!-- Y=2.5 偏北侧一点，面向走廊内部 -->
+      <pose>-9.2 2.5 0 0 0 1.5708</pose>
+      <static>true</static>
+    </include>
+
+    <include>
+      <name>west_cabinet_anchor</name>
+      <uri>model://cabinet</uri>
+      <!-- Y=-2.5 偏南侧一点，面向走廊内部 -->
+      <pose>-9.2 -2.5 0 0 0 1.5708</pose>
+      <static>true</static>
+    </include>
+    <!-- ==================================================================== -->
+     
+    <actor name="actor_patrol">
+      <pose>7.5 -5.0 0 0 0 1.57</pose>
+      
+      <skin>
+        <filename>walk.dae</filename>
+        <scale>1.0</scale>
+      </skin>
+      
+      <animation name="walking">
+        <filename>walk.dae</filename>
+        <scale>1.0</scale>
+        <interpolate_x>false</interpolate_x>
+      </animation>
+
+      <script>
+        <loop>true</loop>
+        <delay_start>0.0</delay_start>
+        <auto_start>true</auto_start>
+        
+        <trajectory id="0" type="walking" tension="0.0">
+          <waypoint><time>0.0</time><pose>7.5 -5.0 0 0 0 1.57</pose></waypoint>
+          <waypoint><time>10.0</time><pose>7.5 5.0 0 0 0 1.57</pose></waypoint>
+          
+          <waypoint><time>11.0</time><pose>7.5 5.0 0 0 0 3.14</pose></waypoint>
+          <waypoint><time>12.0</time><pose>7.5 5.0 0 0 0 -1.57</pose></waypoint>
+          
+          <waypoint><time>22.0</time><pose>7.5 5.0 0 0 0 -1.57</pose></waypoint>
+          <waypoint><time>32.0</time><pose>7.5 -5.0 0 0 0 -1.57</pose></waypoint>
+          
+          <waypoint><time>33.0</time><pose>7.5 -5.0 0 0 0 0</pose></waypoint>
+          <waypoint><time>34.0</time><pose>7.5 -5.0 0 0 0 1.57</pose></waypoint>
+        </trajectory>
+      </script>
+    </actor>
+ 
+  </world>
+</sdf>

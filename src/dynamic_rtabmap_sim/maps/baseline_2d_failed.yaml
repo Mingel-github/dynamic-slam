@@ -1,0 +1,7 @@
+image: baseline_2d_failed.pgm
+resolution: 0.05
+origin: [-10.638, -10.5081, 0.0]
+negate: 0
+occupied_thresh: 0.5
+free_thresh: 0.196
+

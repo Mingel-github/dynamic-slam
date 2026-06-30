@@ -1,0 +1,37 @@
+# ROS2 编译产物
+build/
+install/
+log/
+
+# 第三方包（自带 git，独立管理）
+src/LIO-SAM/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时文件
+*.tmp
+*.bak
+.DS_Store
+
+# 大二进制数据（运行时产生，不放 git）
+*.db          # RTAB-Map 数据库
+*.pcd         # 点云数据
+*.ply         # 网格模型
+*.pt          # PyTorch 模型权重
+*.pth         # PyTorch checkpoint
+maps/install/ # 误放的安装文件
+
+# rosdep / colcon
+src/COLCON_IGNORE

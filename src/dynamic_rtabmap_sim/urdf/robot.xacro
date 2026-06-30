@@ -1,0 +1,164 @@
+<?xml version="1.0" ?>
+<robot name="geo_bot" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <material name="blue"><color rgba="0 0 0.8 1"/></material>
+  <material name="black"><color rgba="0 0 0 1"/></material>
+  <material name="white"><color rgba="1 1 1 1"/></material>
+
+  <xacro:macro name="box_inertia" params="m w h d">
+    <inertial>
+      <mass value="${m}"/><inertia ixx="${(m/12) * (h*h + d*d)}" ixy="0.0" ixz="0.0" iyy="${(m/12) * (w*w + d*d)}" iyz="0.0" izz="${(m/12) * (w*w + h*h)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertia" params="m r h">
+    <inertial>
+      <mass value="${m}"/><inertia ixx="${(m/12) * (3*r*r + h*h)}" ixy="0.0" ixz="0.0" iyy="${(m/12) * (3*r*r + h*h)}" iyz="0.0" izz="${(m/2) * (r*r)}"/>
+    </inertial>
+  </xacro:macro>
+
+  <link name="base_footprint"/>
+  <joint name="base_joint" type="fixed">
+    <parent link="base_footprint"/><child link="base_link"/>
+    <origin xyz="0 0 0.15" rpy="0 0 0"/> 
+  </joint>
+
+  <link name="base_link">
+    <visual><geometry><box size="0.5 0.3 0.1"/></geometry> <material name="blue"/></visual>
+    <collision><geometry><box size="0.5 0.3 0.1"/></geometry></collision>
+    <xacro:box_inertia m="5.0" w="0.5" h="0.3" d="0.1"/>
+  </link>
+
+  <link name="wheel_left_link">
+    <visual><geometry><cylinder radius="0.1" length="0.05"/></geometry><material name="black"/></visual>
+    <collision><geometry><cylinder radius="0.1" length="0.05"/></geometry></collision>
+    <xacro:cylinder_inertia m="1.0" r="0.1" h="0.05"/>
+  </link>
+  <joint name="wheel_left_joint" type="continuous">
+    <parent link="base_link"/><child link="wheel_left_link"/>
+    <origin xyz="0.15 0.20 -0.05" rpy="-1.57 0 0"/><axis xyz="0 0 1"/>
+    </joint>
+
+  <link name="wheel_right_link">
+    <visual><geometry><cylinder radius="0.1" length="0.05"/></geometry><material name="black"/></visual>
+    <collision><geometry><cylinder radius="0.1" length="0.05"/></geometry></collision>
+    <xacro:cylinder_inertia m="1.0" r="0.1" h="0.05"/>
+  </link>
+  <joint name="wheel_right_joint" type="continuous">
+    <parent link="base_link"/><child link="wheel_right_link"/>
+    <origin xyz="0.15 -0.20 -0.05" rpy="-1.57 0 0"/><axis xyz="0 0 1"/>
+    </joint>
+
+  <link name="caster_link">
+    <visual><geometry><sphere radius="0.05"/></geometry><material name="white"/></visual>
+    <collision><geometry><sphere radius="0.05"/></geometry></collision>
+    <inertial>
+      <mass value="0.01"/>
+      <inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/>
+    </inertial>
+  </link>
+  <joint name="caster_joint" type="fixed">
+    <parent link="base_link"/><child link="caster_link"/><origin xyz="-0.2 0 -0.1"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/><child link="imu_link"/><origin xyz="0 0 0" rpy="0 0 0"/>
+  </joint>
+
+  <link name="velodyne">
+    <visual><geometry><cylinder radius="0.05" length="0.06"/></geometry><material name="black"/></visual>
+    <collision><geometry><cylinder radius="0.05" length="0.06"/></geometry></collision>
+    <xacro:cylinder_inertia m="0.1" r="0.05" h="0.06"/>
+  </link>
+  <joint name="velodyne_joint" type="fixed">
+    <parent link="base_link"/><child link="velodyne"/><origin xyz="0.1 0 0.1" rpy="0 0 0"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual><geometry><box size="0.02 0.1 0.02"/></geometry><material name="white"/></visual>
+  </link>
+  <joint name="camera_joint" type="fixed">
+    <parent link="base_link"/><child link="camera_link"/><origin xyz="0.2 0 0.05" rpy="0 0 0"/>
+  </joint>
+  <link name="camera_link_optical"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="-1.5707 0 -1.5707"/>
+    <parent link="camera_link"/><child link="camera_link_optical"/>
+  </joint>
+
+  <gazebo reference="caster_link">
+    <mu1>0.0</mu1>
+    <mu2>0.0</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+    <material>Gazebo/White</material>
+  </gazebo>
+
+  <gazebo reference="wheel_left_link">
+    <mu1>1.2</mu1>
+    <mu2>1.2</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+  </gazebo>
+
+  <gazebo reference="wheel_right_link">
+    <mu1>1.2</mu1>
+    <mu2>1.2</mu2>
+    <kp>1000000.0</kp>
+    <kd>100.0</kd>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
+      <update_rate>30</update_rate>
+      <left_joint>wheel_left_joint</left_joint>
+      <right_joint>wheel_right_joint</right_joint>
+      <wheel_separation>0.4</wheel_separation>
+      <wheel_diameter>0.2</wheel_diameter>
+      
+      <max_wheel_torque>20.0</max_wheel_torque>
+      <max_wheel_acceleration>2.0</max_wheel_acceleration>
+
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
+    </plugin>
+  </gazebo>
+
+  <gazebo reference="camera_link">
+    <sensor type="depth" name="camera">
+      <update_rate>20</update_rate>
+      <camera>
+        <horizontal_fov>1.047</horizontal_fov>
+        <image><width>640</width><height>480</height><format>R8G8B8</format></image>
+        <clip><near>0.05</near><far>8.0</far></clip>
+      </camera>
+      <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+        <frame_name>camera_link_optical</frame_name>
+        <min_depth>0.1</min_depth>
+        <max_depth>8.0</max_depth>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="velodyne">
+    <sensor type="ray" name="velodyne_sensor">
+      <visualize>false</visualize>
+      <update_rate>10</update_rate>
+      <ray>
+        <scan>
+          <horizontal><samples>360</samples><resolution>1</resolution><min_angle>-3.14</min_angle><max_angle>3.14</max_angle></horizontal>
+          <vertical><samples>16</samples><resolution>1</resolution><min_angle>-0.26</min_angle><max_angle>0.26</max_angle></vertical>
+        </scan>
+        <range><min>0.3</min><max>10.0</max></range>
+      </ray>
+      <plugin name="gazebo_ros_laser_controller" filename="libgazebo_ros_velodyne_laser.so">
+        <ros><remapping>~/out:=/points_raw</remapping></ros>
+        <frame_name>velodyne</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+</robot>
