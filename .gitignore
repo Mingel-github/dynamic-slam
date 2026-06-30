@@ -26,12 +26,12 @@ __pycache__/
 .DS_Store
 
 # 大二进制数据（运行时产生，不放 git）
-*.db          # RTAB-Map 数据库
-*.pcd         # 点云数据
-*.ply         # 网格模型
-*.pt          # PyTorch 模型权重
-*.pth         # PyTorch checkpoint
-maps/install/ # 误放的安装文件
+*.db
+*.pcd
+*.ply
+*.pt
+*.pth
+maps/install/
 
 # rosdep / colcon
 src/COLCON_IGNORE
