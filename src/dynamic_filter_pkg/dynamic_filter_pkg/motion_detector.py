@@ -173,14 +173,42 @@ class MotionDetector:
         X_prev[valid] = (u_grid[valid] - cx) * z_prev[valid] / fx
         Y_prev[valid] = (v_grid[valid] - cy) * z_prev[valid] / fy
 
-        # 组装有效点的 (N,3) 点云
+        # --- 组装有效点的 (N,3) 点云 ---
         P_prev = np.stack([
             X_prev[valid], Y_prev[valid], z_prev[valid]
         ], axis=-1)  # (N,3)
 
+        # 一次性形状诊断日志：仅首次成功时打印，用于远程排障
+        if not hasattr(self, '_shapes_logged'):
+            self._shapes_logged = True
+            import sys
+            print(
+                f'[detect_multiview] First call OK: '
+                f'z_prev.shape={z_prev.shape}, '
+                f'valid_count={np.count_nonzero(valid)}, '
+                f'P_prev.shape={P_prev.shape}, '
+                f'T_prev_to_curr.shape={T_prev_to_curr.shape}',
+                file=sys.stderr)
+
         # --- 帧间刚体变换 ---
         R = T_prev_to_curr[:3, :3]
         t = T_prev_to_curr[:3, 3]
+
+        # 防御性形状检查：避免因上游数据异常导致 matmul 崩溃
+        if P_prev.ndim != 2 or P_prev.shape[1] != 3:
+            import sys
+            print(
+                f'[detect_multiview] SHAPE ERROR: '
+                f'P_prev.shape={P_prev.shape}, P_prev.ndim={P_prev.ndim}, '
+                f'R.shape={R.shape}, T_prev_to_curr.shape={T_prev_to_curr.shape}, '
+                f'z_prev.shape={z_prev.shape}, current_depth.shape={current_depth.shape}, '
+                f'bg_mask.shape={bg_mask.shape}, valid.shape={valid.shape}, '
+                f'valid_count={np.count_nonzero(valid)}, '
+                f'X_prev.shape={X_prev.shape}, u_grid.shape={u_grid.shape}',
+                file=sys.stderr)
+            self._store_frame(current_bgr, current_depth)
+            return motion_mask, False
+
         P_curr = (R @ P_prev.T + t.reshape(3, 1)).T  # (N,3)
 
         # --- 重投影到当前帧像素坐标 ---

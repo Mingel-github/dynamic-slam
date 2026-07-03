@@ -141,7 +141,11 @@ class SemanticFilterNode(Node):
                 self.get_logger().info(
                     '里程计超时 (>50ms)，使用 LK+RANSAC 降级路径',
                     throttle_duration_sec=10.0)
-            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            # 降级时也保持帧缓冲更新，避免多视图恢复时 prev_depth 过旧
+            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            self.motion_detector._store_frame(cv_img, cv_depth)
+            self.last_camera_pose = None  # 位姿不连续，重置多视图状态
+            return mask
 
         # --- 主路径：多视图深度重投影 ---
         T_world_curr = self._odom_to_pose_matrix(self.latest_odom)
@@ -157,16 +161,37 @@ class SemanticFilterNode(Node):
         T_prev_to_curr = self._compute_relative_transform(
             self.last_camera_pose, T_world_curr)
 
+        # 防御性检查：位姿矩阵形状必须为 (4,4)
+        if T_prev_to_curr.shape != (4, 4):
+            self.get_logger().error(
+                f'位姿矩阵形状异常: T_prev_to_curr.shape={T_prev_to_curr.shape}，'
+                f'降级到 LK+RANSAC', throttle_duration_sec=5.0)
+            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            self.motion_detector._store_frame(cv_img, cv_depth)
+            self.last_camera_pose = None
+            return mask
+
         camera_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
-        motion_mask, used_multiview = self.motion_detector.detect_multiview(
-            cv_img, cv_depth, semantic_mask_np, camera_intrinsics, T_prev_to_curr)
+        try:
+            motion_mask, used_multiview = self.motion_detector.detect_multiview(
+                cv_img, cv_depth, semantic_mask_np, camera_intrinsics, T_prev_to_curr)
+        except Exception as e:
+            self.get_logger().error(
+                f'多视图检测异常，降级到 LK+RANSAC: {e}',
+                throttle_duration_sec=5.0)
+            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            self.motion_detector._store_frame(cv_img, cv_depth)
+            self.last_camera_pose = None  # 多视图状态不一致，重置
+            return mask
 
         # 持久化当前帧位姿供下一帧使用
         self.last_camera_pose = T_world_curr
 
         if not used_multiview:
             # detect_multiview 因首帧等原因未产出有效结果，降级
-            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            self.motion_detector._store_frame(cv_img, cv_depth)
+            return mask
 
         return motion_mask
 
