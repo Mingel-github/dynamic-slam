@@ -3,12 +3,13 @@ import numpy as np
 
 class MotionDetector:
     def __init__(self, max_corners=300, min_displacement=2.0, depth_tolerance=0.15,
-                 reprojection_threshold=0.1, min_valid_depth=0.1):
+                 reprojection_threshold=0.15, min_valid_depth=0.1):
         """
         :param max_corners: LK光流追踪的最大角点数
         :param min_displacement: 判定为动态外点的最小像素位移（过滤背景微小抖动）
         :param depth_tolerance: FloodFill 深度生长的容忍度（米）
-        :param reprojection_threshold: 多视图深度重投影的动态判定阈值（米）
+        :param reprojection_threshold: 多视图深度重投影的基础判定阈值（米）。
+               实际采用深度自适应: max(0.15, min(0.5, base + 0.02*Z))，参考 DynaSLAM τ_z=0.4m。
         :param min_valid_depth: 参与多视图运算的最小有效深度（米）
         """
         self.max_corners = max_corners
@@ -231,13 +232,36 @@ class MotionDetector:
             self.has_prev_frame = True
             return motion_mask, False  # 无有效重投影 → 降级到 LK
 
-        # --- 深度差比较 → 动态种子 ---
-        u_int = np.clip(np.round(u_proj[reproj_valid]).astype(int), 0, w - 1)
-        v_int = np.clip(np.round(v_proj[reproj_valid]).astype(int), 0, h - 1)
-        z_measured = current_depth[v_int, u_int]
+        # --- 视差角过滤（B2）：α > 30° 的匹配忽略 ---
+        # 参考 DynaSLAM Section III-C：大角度观测时深度变化不可靠
+        P_prev_reproj = P_prev[reproj_valid]   # (K,3) 前帧相机→3D点
+        P_curr_reproj = P_curr[reproj_valid]   # (K,3) 当前帧相机→同一3D点
 
-        depth_diff = np.abs(z_proj[reproj_valid] - z_measured)
-        dynamic_flags = depth_diff > self.reprojection_threshold
+        norm_prev = np.linalg.norm(P_prev_reproj, axis=1)
+        norm_curr = np.linalg.norm(P_curr_reproj, axis=1)
+        cos_alpha = np.sum(P_prev_reproj * P_curr_reproj, axis=1) / (norm_prev * norm_curr + 1e-10)
+        cos_alpha = np.clip(cos_alpha, -1.0, 1.0)
+        parallax_ok = cos_alpha > 0.866  # cos(30°) ≈ 0.866
+
+        if np.count_nonzero(parallax_ok) == 0:
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
+            return motion_mask, False  # 视差角全部过大 → 降级到 LK
+
+        # --- 深度差比较 → 动态种子（B1：深度自适应阈值）---
+        u_int = np.clip(np.round(u_proj[reproj_valid][parallax_ok]).astype(int), 0, w - 1)
+        v_int = np.clip(np.round(v_proj[reproj_valid][parallax_ok]).astype(int), 0, h - 1)
+        z_measured = current_depth[v_int, u_int]
+        z_proj_filtered = z_proj[reproj_valid][parallax_ok]
+
+        # B1: 深度自适应阈值 = 基准0.15 + Z的2%，上界0.5m
+        # 近处(~1m): 0.17m, 中距离(~5m): 0.25m, 远处(≥17.5m): 0.50m
+        # 参考 DynaSLAM 经验最优值 τ_z = 0.4m
+        adaptive_threshold = self.reprojection_threshold + 0.02 * z_proj_filtered
+        adaptive_threshold = np.clip(adaptive_threshold, 0.15, 0.50)
+
+        depth_diff = np.abs(z_proj_filtered - z_measured)
+        dynamic_flags = depth_diff > adaptive_threshold
 
         dynamic_u = u_int[dynamic_flags]
         dynamic_v = v_int[dynamic_flags]
