@@ -14,6 +14,7 @@ import cv2
 import numpy as np
 import torch
 import os
+import tf2_ros
 from ament_index_python.packages import get_package_share_directory
 from ultralytics import YOLO
 
@@ -58,7 +59,16 @@ class SemanticFilterNode(Node):
         self.latest_odom = None
         self.latest_odom_time = None
         self.last_camera_pose = None   # 上一帧的相机位姿 (4,4) 齐次矩阵
-        self.pose_timeout = 0.05       # 里程计超时阈值（秒），超时降级到 LK+RANSAC
+        self.pose_timeout = 0.1        # 里程计超时阈值（秒），30Hz odom 容忍~3帧丢失
+
+        # P1: TF — 获取 camera_link_optical 在世界帧中的真实位姿
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.T_base_to_camera = self._init_camera_transform()
+        self.get_logger().info(
+            f'相机静态变换T_base→optical已加载: '
+            f'translation=({self.T_base_to_camera[0,3]:.3f}, '
+            f'{self.T_base_to_camera[1,3]:.3f}, {self.T_base_to_camera[2,3]:.3f})')
 
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, 10)
@@ -86,6 +96,41 @@ class SemanticFilterNode(Node):
         """缓存最新的轮式里程计消息。"""
         self.latest_odom = msg
         self.latest_odom_time = self.get_clock().now()
+
+    def _init_camera_transform(self):
+        """
+        获取 base_footprint → camera_link_optical 的静态刚体变换 (4×4)。
+
+        优先从 TF 树查询（适配不同机器人URDF），失败时回退到硬编码值。
+        该变换在节点生命周期内保持不变（static joint）。
+        """
+        # 尝试从 TF 获取
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'base_footprint', 'camera_link_optical',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=3.0))
+            trans = t.transform.translation
+            rot = t.transform.rotation
+            R = self._quat_to_rotm(rot.x, rot.y, rot.z, rot.w)
+            T = np.eye(4)
+            T[:3, :3] = R
+            T[:3, 3] = [trans.x, trans.y, trans.z]
+            self.get_logger().info('相机静态变换已从 TF 树获取')
+            return T
+        except Exception as e:
+            self.get_logger().warn(
+                f'TF 查询 camera 变换失败 ({e})，使用 URDF 硬编码值')
+
+        # 回退：从 robot.xacro 硬编码
+        # 变换链: base_footprint → base_link(0,0,0.15) → camera_link(0.2,0,0.05) → optical(rpy=-π/2,0,-π/2)
+        T = np.eye(4)
+        # optical frame 旋转矩阵: z-forward, x-right, y-down → base(x-forward, y-left, z-up)
+        T[:3, :3] = [[0, 0, 1],
+                      [-1, 0, 0],
+                      [0, -1, 0]]
+        T[:3, 3] = [0.2, 0, 0.2]   # x=0.2 (相机前移), z=0.15+0.05=0.2 (底座+支架高度)
+        return T
 
     @staticmethod
     def _quat_to_rotm(qx, qy, qz, qw):
@@ -139,7 +184,7 @@ class SemanticFilterNode(Node):
                     throttle_duration_sec=10.0)
             else:
                 self.get_logger().info(
-                    '里程计超时 (>50ms)，使用 LK+RANSAC 降级路径',
+                    '里程计超时 (>100ms)，使用 LK+RANSAC 降级路径',
                     throttle_duration_sec=10.0)
             # 降级时也保持帧缓冲更新，避免多视图恢复时 prev_depth 过旧
             mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
@@ -148,7 +193,9 @@ class SemanticFilterNode(Node):
             return mask
 
         # --- 主路径：多视图深度重投影 ---
-        T_world_curr = self._odom_to_pose_matrix(self.latest_odom)
+        # 将 /odom (base_footprint→odom) 与静态变换组合，得到相机真实位姿
+        T_world_base = self._odom_to_pose_matrix(self.latest_odom)
+        T_world_curr = T_world_base @ self.T_base_to_camera  # camera_link_optical 在世界帧的位姿
 
         if self.last_camera_pose is None:
             # 首帧：仅有里程计但无上一帧位姿 → 先缓冲帧，用 LK 出结果后再持久化位姿
