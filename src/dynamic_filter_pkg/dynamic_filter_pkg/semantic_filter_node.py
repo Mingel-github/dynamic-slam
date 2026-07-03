@@ -3,8 +3,9 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
+from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point  # [新增] 用于构建轨迹点
+from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 import message_filters
 from rclpy.qos import qos_profile_sensor_data
@@ -18,6 +19,8 @@ from ultralytics import YOLO
 
 # 引入光流运动引擎
 from .motion_detector import MotionDetector
+# P2: Kalman 追踪器
+from .kalman_tracker import KalmanFilter3D, TrackState
 
 class SemanticFilterNode(Node):
     def __init__(self):
@@ -48,6 +51,18 @@ class SemanticFilterNode(Node):
         self.track_history = {}   # 格式: {track_id: [(X, Y, Z), ...]}
         self.max_history_len = 50 # 贪吃蛇的长度，保存过去 50 个点
 
+        # P2: Kalman Filter 池 — 每个 track_id 对应一个 KF 实例
+        self.kf_pool: dict[int, KalmanFilter3D] = {}
+
+        # P1: 里程计订阅 — 用于多视图几何一致性的帧间位姿
+        self.latest_odom = None
+        self.latest_odom_time = None
+        self.last_camera_pose = None   # 上一帧的相机位姿 (4,4) 齐次矩阵
+        self.pose_timeout = 0.05       # 里程计超时阈值（秒），超时降级到 LK+RANSAC
+
+        self.odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10)
+
         # 2. 设置时间同步订阅器
         self.image_sub = message_filters.Subscriber(self, Image, '/camera/image_raw', qos_profile=qos_profile_sensor_data)
         self.depth_sub = message_filters.Subscriber(self, Image, '/camera/depth/image_raw', qos_profile=qos_profile_sensor_data)
@@ -62,6 +77,99 @@ class SemanticFilterNode(Node):
         self.depth_pub = self.create_publisher(Image, '/camera/depth/image_filtered', 10)
         self.debug_pub = self.create_publisher(Image, '/camera/image_debug', 10)
         self.track_pub = self.create_publisher(MarkerArray, '/pedestrian_tracks', 10)
+
+    # ========================================================================
+    #  P1: 里程计回调 + 帧间位姿计算
+    # ========================================================================
+
+    def odom_callback(self, msg):
+        """缓存最新的轮式里程计消息。"""
+        self.latest_odom = msg
+        self.latest_odom_time = self.get_clock().now()
+
+    @staticmethod
+    def _quat_to_rotm(qx, qy, qz, qw):
+        """四元数 → 3×3 旋转矩阵（手动实现，避免 scipy 依赖）"""
+        return np.array([
+            [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),         1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),         2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)]
+        ])
+
+    def _odom_to_pose_matrix(self, odom_msg):
+        """Odometry 消息 → 4×4 齐次变换矩阵（世界坐标系下的机器人位姿）。"""
+        p = odom_msg.pose.pose.position
+        q = odom_msg.pose.pose.orientation
+        R = self._quat_to_rotm(q.x, q.y, q.z, q.w)
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [p.x, p.y, p.z]
+        return T
+
+    def _compute_relative_transform(self, T_world_prev, T_world_curr):
+        """
+        计算帧间相机运动：T_prev→curr
+
+        P_world = T_world_prev @ P_prev = T_world_curr @ P_curr
+        ⇒ P_curr = inv(T_world_curr) @ T_world_prev @ P_prev
+        ⇒ T_prev→curr = inv(T_world_curr) @ T_world_prev
+        """
+        return np.linalg.inv(T_world_curr) @ T_world_prev
+
+    def _run_motion_detection(self, cv_img, cv_depth, semantic_mask_np, fx, fy, cx, cy):
+        """
+        运动检测调度：多视图几何（主路径）→ LK+RANSAC（降级备份）。
+
+        返回: motion_mask_np (uint8, H×W)
+        """
+        current_time = self.get_clock().now()
+
+        # --- 判断里程计是否新鲜可用 ---
+        pose_stale = (
+            self.latest_odom is None or
+            self.latest_odom_time is None or
+            (current_time - self.latest_odom_time).nanoseconds * 1e-9 > self.pose_timeout
+        )
+
+        if pose_stale:
+            # 降级路径：里程计超时或不可用
+            if self.latest_odom is None:
+                self.get_logger().warn(
+                    '未收到 /odom 里程计数据，使用 LK+RANSAC 降级路径',
+                    throttle_duration_sec=10.0)
+            else:
+                self.get_logger().info(
+                    '里程计超时 (>50ms)，使用 LK+RANSAC 降级路径',
+                    throttle_duration_sec=10.0)
+            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+
+        # --- 主路径：多视图深度重投影 ---
+        T_world_curr = self._odom_to_pose_matrix(self.latest_odom)
+
+        if self.last_camera_pose is None:
+            # 首帧：仅有里程计但无上一帧位姿，缓冲帧并降级
+            self.motion_detector.prev_rgb = cv_img.copy()
+            self.motion_detector.prev_depth = cv_depth.copy()
+            self.motion_detector.has_prev_frame = True
+            self.last_camera_pose = T_world_curr
+            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+
+        # 计算帧间相机运动
+        T_prev_to_curr = self._compute_relative_transform(
+            self.last_camera_pose, T_world_curr)
+
+        camera_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+        motion_mask, used_multiview = self.motion_detector.detect_multiview(
+            cv_img, cv_depth, semantic_mask_np, camera_intrinsics, T_prev_to_curr)
+
+        # 持久化当前帧位姿供下一帧使用
+        self.last_camera_pose = T_world_curr
+
+        if not used_multiview:
+            # detect_multiview 因首帧等原因未产出有效结果，降级
+            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+
+        return motion_mask
 
     def sync_callback(self, img_msg, depth_msg, info_msg):
         try:
@@ -100,66 +208,87 @@ class SemanticFilterNode(Node):
                     else:
                         semantic_mask_np = raw_mask
 
-                # 2. 3D 目标追踪映射
+                # 2. 3D 目标追踪映射（Kalman Filter 平滑）
                 if result.boxes.id is not None:
                     boxes = result.boxes.xyxy.cpu().numpy()
                     track_ids = result.boxes.id.int().cpu().numpy()
+                    current_time = self.get_clock().now()
 
                     for box, track_id in zip(boxes, track_ids):
                         current_active_ids.add(track_id)
                         x1, y1, x2, y2 = map(int, box)
-                        
+
                         u = (x1 + x2) / 2.0
                         v = (y1 + y2) / 2.0
-                        
+
                         roi = cv_depth[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                         if roi.size == 0 or np.all(np.isnan(roi)):
                             continue
-                            
+
                         Z = np.nanmedian(roi)
                         if np.isnan(Z) or Z <= 0.1:
                             continue
 
                         X = (u - cx) * Z / fx
                         Y = (v - cy) * Z / fy
+                        bbox_area = (x2 - x1) * (y2 - y1)
 
-                        # [新增] 记录历史轨迹坐标
+                        # --- KF 预测 + 更新 ---
+                        if track_id not in self.kf_pool:
+                            self.kf_pool[track_id] = KalmanFilter3D(
+                                track_id, (X, Y, Z), current_time)
+
+                        kf = self.kf_pool[track_id]
+                        kf.predict(current_time=current_time)
+                        kf_smoothed = kf.update(
+                            (X, Y, Z), bbox_area=bbox_area, current_time=current_time)
+                        kf_x, kf_y, kf_z = float(kf_smoothed[0]), float(kf_smoothed[1]), float(kf_smoothed[2])
+
+                        # 轨迹历史：喂入 KF 平滑位置（用于 RViz 路径可视化）
                         if track_id not in self.track_history:
                             self.track_history[track_id] = []
-                        self.track_history[track_id].append((X, Y, Z))
-                        
-                        # 限制轨迹长度，丢弃最早的点
+                        self.track_history[track_id].append((kf_x, kf_y, kf_z))
                         if len(self.track_history[track_id]) > self.max_history_len:
                             self.track_history[track_id].pop(0)
 
-                        # 构建 3D Bbox Marker
+                        # 构建 Marker（使用 KF 平滑位置替代原始观测）
+                        bbox_color = (0.0, 1.0, 0.0, 0.5)  # 绿色：正常
+                        if kf.state == TrackState.OCCLUDED:
+                            bbox_color = (1.0, 1.0, 0.0, 0.5)  # 黄色：遮挡
+
                         bbox_marker = self.create_marker(
-                            header=img_msg.header, marker_type=Marker.CUBE, 
-                            m_id=int(track_id), color=(0.0, 1.0, 0.0, 0.5), scale=(0.6, 0.6, 1.6),
-                            x=X, y=Y, z=Z
+                            header=img_msg.header, marker_type=Marker.CUBE,
+                            m_id=int(track_id), color=bbox_color, scale=(0.6, 0.6, 1.6),
+                            x=kf_x, y=kf_y, z=kf_z
                         )
-                        # 构建 ID 文本 Marker
                         text_marker = self.create_marker(
-                            header=img_msg.header, marker_type=Marker.TEXT_VIEW_FACING, 
-                            m_id=int(track_id) + 1000, color=(1.0, 1.0, 1.0, 1.0), scale=(0.0, 0.0, 0.4),
-                            x=X, y=Y, z=Z - 1.0, text=f"ID: {track_id}"
+                            header=img_msg.header, marker_type=Marker.TEXT_VIEW_FACING,
+                            m_id=int(track_id) + 1000, color=(1.0, 1.0, 1.0, 1.0),
+                            scale=(0.0, 0.0, 0.4),
+                            x=kf_x, y=kf_y, z=kf_z - 1.0, text=f"ID: {track_id}"
                         )
-                        # [新增] 构建 轨迹线条 Marker
                         path_marker = self.create_path_marker(
-                            header=img_msg.header, track_id=int(track_id), history=self.track_history[track_id]
+                            header=img_msg.header, track_id=int(track_id),
+                            history=self.track_history[track_id]
                         )
-                        
+
                         marker_array.markers.extend([bbox_marker, text_marker, path_marker])
 
-            # [新增] 内存管理：清理已经消失超过一定时间的 ID 的轨迹
-            expired_ids = [tid for tid in self.track_history.keys() if tid not in current_active_ids]
-            for tid in expired_ids:
-                # 为了防止刚离开视线轨迹就消失，这里可以做一个稍微延迟的删除逻辑。
-                # 目前简单起见，如果从画面丢失，就清空该 ID 记录释放内存。
-                del self.track_history[tid]
+            # P2: 对当前帧未观测到的轨迹执行预测（遮挡处理）
+            current_time = self.get_clock().now()
+            for track_id in list(self.kf_pool.keys()):
+                if track_id not in current_active_ids:
+                    kf = self.kf_pool[track_id]
+                    kf.predict(current_time=current_time)
+                    if kf.is_lost:
+                        # 长期丢失：清理 KF 和轨迹历史
+                        del self.kf_pool[track_id]
+                        if track_id in self.track_history:
+                            del self.track_history[track_id]
 
-            # 3. 执行运动目标检测
-            motion_mask_np = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            # 3. 运动目标检测（多视图几何为主，LK+RANSAC 降级备份）
+            motion_mask_np = self._run_motion_detection(cv_img, cv_depth, semantic_mask_np,
+                                                         fx, fy, cx, cy)
 
             # 4. 掩码并集融合
             final_mask = semantic_mask_np | (motion_mask_np > 0)

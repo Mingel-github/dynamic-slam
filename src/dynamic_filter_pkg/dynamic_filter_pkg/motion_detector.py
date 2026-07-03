@@ -2,17 +2,27 @@ import cv2
 import numpy as np
 
 class MotionDetector:
-    def __init__(self, max_corners=300, min_displacement=2.0, depth_tolerance=0.15):
+    def __init__(self, max_corners=300, min_displacement=2.0, depth_tolerance=0.15,
+                 reprojection_threshold=0.1, min_valid_depth=0.1):
         """
         :param max_corners: LK光流追踪的最大角点数
         :param min_displacement: 判定为动态外点的最小像素位移（过滤背景微小抖动）
-        :param depth_tolerance: FloodFill 深度生长的容忍度（米）。0.15表示深度差在15cm内视为同一物体。
+        :param depth_tolerance: FloodFill 深度生长的容忍度（米）
+        :param reprojection_threshold: 多视图深度重投影的动态判定阈值（米）
+        :param min_valid_depth: 参与多视图运算的最小有效深度（米）
         """
         self.max_corners = max_corners
         self.min_displacement = min_displacement
         self.depth_tolerance = depth_tolerance
+        self.reprojection_threshold = reprojection_threshold
+        self.min_valid_depth = min_valid_depth
         self.prev_gray = None
         self.prev_pts = None
+
+        # 多视图几何帧缓冲
+        self.prev_rgb = None
+        self.prev_depth = None
+        self.has_prev_frame = False
 
     def detect(self, current_bgr, current_depth, semantic_mask):
         current_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
@@ -99,8 +109,155 @@ class MotionDetector:
         # 每帧强制刷新角点，避免特征点随时间漂移失效
         self.prev_gray = current_gray
         self.prev_pts = cv2.goodFeaturesToTrack(
-            current_gray, mask=valid_bg_mask, maxCorners=self.max_corners, 
+            current_gray, mask=valid_bg_mask, maxCorners=self.max_corners,
             qualityLevel=0.01, minDistance=10
         )
-        
+
         return motion_mask
+
+    # ========================================================================
+    #  P1: 多视图几何一致性检测（深度重投影法）
+    # ========================================================================
+
+    @staticmethod
+    def _quat_to_rotm(qx, qy, qz, qw):
+        """四元数 → 3×3 旋转矩阵（手动实现，避免 scipy 依赖）"""
+        return np.array([
+            [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw),         1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw),         2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)]
+        ])
+
+    def detect_multiview(self, current_bgr, current_depth, semantic_mask,
+                         camera_intrinsics, T_prev_to_curr):
+        """
+        多视图深度重投影运动检测（P1 主路径）。
+
+        原理: 将前一帧背景像素投影到3D → 用帧间位姿变换到当前帧 → 重投影回2D
+              → 比较投影深度与实测深度 → 差异大者为动态物体。
+
+        :param current_bgr:      当前帧 BGR 图像 (H,W,3)
+        :param current_depth:    当前帧深度图 (H,W) float32
+        :param semantic_mask:    已知动态区域布尔掩码 (H,W)，这些像素不参与检测
+        :param camera_intrinsics: dict {'fx','fy','cx','cy'}
+        :param T_prev_to_curr:   (4,4) 齐次变换阵，前一帧相机坐标系→当前帧相机坐标系
+        :return: (motion_mask_uint8, used_multiview_bool)
+        """
+        h, w = current_depth.shape
+        motion_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # --- 首帧：仅缓冲，返回空掩码 ---
+        if not self.has_prev_frame:
+            self._store_frame(current_bgr, current_depth)
+            return motion_mask, False
+
+        fx = camera_intrinsics['fx']
+        fy = camera_intrinsics['fy']
+        cx = camera_intrinsics['cx']
+        cy = camera_intrinsics['cy']
+
+        # --- 背景像素掩码：排除已知语义动态区域 ---
+        if semantic_mask is not None and semantic_mask.any():
+            bg_mask = ~semantic_mask
+        else:
+            bg_mask = np.ones((h, w), dtype=bool)
+
+        z_prev = self.prev_depth
+
+        # --- 有效像素：背景 + 深度有效 + 有限值 ---
+        valid = (bg_mask &
+                 (z_prev > self.min_valid_depth) &
+                 np.isfinite(z_prev))
+
+        if np.count_nonzero(valid) == 0:
+            self._store_frame(current_bgr, current_depth)
+            return motion_mask, True
+
+        # --- 逐像素 3D 反投影（向量化） ---
+        u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))  # (H,W)
+
+        X_prev = np.zeros_like(z_prev)
+        Y_prev = np.zeros_like(z_prev)
+
+        X_prev[valid] = (u_grid[valid] - cx) * z_prev[valid] / fx
+        Y_prev[valid] = (v_grid[valid] - cy) * z_prev[valid] / fy
+
+        # 组装有效点的 (N,3) 点云
+        P_prev = np.stack([
+            X_prev[valid], Y_prev[valid], z_prev[valid]
+        ], axis=-1)  # (N,3)
+
+        # --- 帧间刚体变换 ---
+        R = T_prev_to_curr[:3, :3]
+        t = T_prev_to_curr[:3, 3]
+        P_curr = (R @ P_prev.T + t.reshape(3, 1)).T  # (N,3)
+
+        # --- 重投影到当前帧像素坐标 ---
+        u_proj = (fx * P_curr[:, 0] / P_curr[:, 2]) + cx
+        v_proj = (fy * P_curr[:, 1] / P_curr[:, 2]) + cy
+        z_proj = P_curr[:, 2]
+
+        # --- 过滤投影越界或深度无效的点 ---
+        reproj_valid = (
+            (u_proj >= 0) & (u_proj < w) &
+            (v_proj >= 0) & (v_proj < h) &
+            (z_proj > self.min_valid_depth)
+        )
+
+        if np.count_nonzero(reproj_valid) == 0:
+            self._store_frame(current_bgr, current_depth)
+            return motion_mask, True
+
+        # --- 深度差比较 → 动态种子 ---
+        u_int = np.clip(np.round(u_proj[reproj_valid]).astype(int), 0, w - 1)
+        v_int = np.clip(np.round(v_proj[reproj_valid]).astype(int), 0, h - 1)
+        z_measured = current_depth[v_int, u_int]
+
+        depth_diff = np.abs(z_proj[reproj_valid] - z_measured)
+        dynamic_flags = depth_diff > self.reprojection_threshold
+
+        dynamic_u = u_int[dynamic_flags]
+        dynamic_v = v_int[dynamic_flags]
+
+        # --- 深度一致性区域生长 ---
+        n_seeds = len(dynamic_u)
+        if n_seeds > 0:
+            floodfill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            clean_depth = np.nan_to_num(current_depth, nan=0.0).astype(np.float32)
+
+            # 种子数量安全上限：过多时截断取前 N 个（避免 floodFill 耗时爆炸）
+            max_seeds = 500
+            if n_seeds > max_seeds:
+                dynamic_u = dynamic_u[:max_seeds]
+                dynamic_v = dynamic_v[:max_seeds]
+
+            for i in range(len(dynamic_u)):
+                x_seed = int(dynamic_u[i])
+                y_seed = int(dynamic_v[i])
+
+                if not (0 <= x_seed < w and 0 <= y_seed < h):
+                    continue
+                if clean_depth[y_seed, x_seed] <= self.min_valid_depth:
+                    continue
+                if floodfill_mask[y_seed + 1, x_seed + 1] > 0:
+                    continue  # 已被之前的生长覆盖
+
+                flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY
+                cv2.floodFill(
+                    clean_depth, floodfill_mask, (x_seed, y_seed),
+                    newVal=0,
+                    loDiff=self.depth_tolerance,
+                    upDiff=self.depth_tolerance,
+                    flags=flags
+                )
+
+            motion_mask = floodfill_mask[1:-1, 1:-1]
+
+        self._store_frame(current_bgr, current_depth)
+        return motion_mask, True
+
+    def _store_frame(self, bgr, depth):
+        """缓存当前帧为下一帧的多视图参考帧。"""
+        self.prev_rgb = bgr.copy()
+        self.prev_depth = depth.copy()
+        self.has_prev_frame = True
