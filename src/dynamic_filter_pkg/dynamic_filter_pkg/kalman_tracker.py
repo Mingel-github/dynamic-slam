@@ -151,8 +151,8 @@ class KalmanFilter3D:
         :param current_time: rclpy Time 对象，用于计算实际 dt
         :return: 预测位置 (x, y, z)
         """
-        # 更新时间步长
-        if current_time is not None:
+        # 更新时间步长（防御 None 输入）
+        if current_time is not None and self.last_update_time is not None:
             dt_ns = (current_time - self.last_update_time).nanoseconds
             self.dt = dt_ns * 1e-9
             self.dt = max(0.01, min(self.dt, 0.5))  # 夹紧到合理范围
@@ -182,8 +182,8 @@ class KalmanFilter3D:
         """
         z = np.array(measurement, dtype=np.float64).reshape(3, 1)
 
-        # 更新时间步长
-        if current_time is not None:
+        # 更新时间步长（防御 None 输入）
+        if current_time is not None and self.last_update_time is not None:
             dt_ns = (current_time - self.last_update_time).nanoseconds
             self.dt = dt_ns * 1e-9
             self.dt = max(0.01, min(self.dt, 0.5))

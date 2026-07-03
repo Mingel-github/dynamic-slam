@@ -128,7 +128,7 @@ class SemanticFilterNode(Node):
         pose_stale = (
             self.latest_odom is None or
             self.latest_odom_time is None or
-            (current_time - self.latest_odom_time).nanoseconds * 1e-9 > self.pose_timeout
+            abs((current_time - self.latest_odom_time).nanoseconds * 1e-9) > self.pose_timeout
         )
 
         if pose_stale:
@@ -147,12 +147,11 @@ class SemanticFilterNode(Node):
         T_world_curr = self._odom_to_pose_matrix(self.latest_odom)
 
         if self.last_camera_pose is None:
-            # 首帧：仅有里程计但无上一帧位姿，缓冲帧并降级
-            self.motion_detector.prev_rgb = cv_img.copy()
-            self.motion_detector.prev_depth = cv_depth.copy()
-            self.motion_detector.has_prev_frame = True
+            # 首帧：仅有里程计但无上一帧位姿 → 先缓冲帧，用 LK 出结果后再持久化位姿
+            motion_mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            self.motion_detector._store_frame(cv_img, cv_depth)
             self.last_camera_pose = T_world_curr
-            return self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            return motion_mask
 
         # 计算帧间相机运动
         T_prev_to_curr = self._compute_relative_transform(

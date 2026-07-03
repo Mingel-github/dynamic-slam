@@ -119,15 +119,6 @@ class MotionDetector:
     #  P1: 多视图几何一致性检测（深度重投影法）
     # ========================================================================
 
-    @staticmethod
-    def _quat_to_rotm(qx, qy, qz, qw):
-        """四元数 → 3×3 旋转矩阵（手动实现，避免 scipy 依赖）"""
-        return np.array([
-            [1 - 2*(qy**2 + qz**2),     2*(qx*qy - qz*qw),     2*(qx*qz + qy*qw)],
-            [2*(qx*qy + qz*qw),         1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
-            [2*(qx*qz - qy*qw),         2*(qy*qz + qx*qw),     1 - 2*(qx**2 + qy**2)]
-        ])
-
     def detect_multiview(self, current_bgr, current_depth, semantic_mask,
                          camera_intrinsics, T_prev_to_curr):
         """
@@ -171,7 +162,7 @@ class MotionDetector:
 
         if np.count_nonzero(valid) == 0:
             self._store_frame(current_bgr, current_depth)
-            return motion_mask, True
+            return motion_mask, False  # 无有效背景像素 → 降级到 LK
 
         # --- 逐像素 3D 反投影（向量化） ---
         u_grid, v_grid = np.meshgrid(np.arange(w), np.arange(h))  # (H,W)
@@ -206,7 +197,7 @@ class MotionDetector:
 
         if np.count_nonzero(reproj_valid) == 0:
             self._store_frame(current_bgr, current_depth)
-            return motion_mask, True
+            return motion_mask, False  # 无有效重投影 → 降级到 LK
 
         # --- 深度差比较 → 动态种子 ---
         u_int = np.clip(np.round(u_proj[reproj_valid]).astype(int), 0, w - 1)
@@ -257,7 +248,8 @@ class MotionDetector:
         return motion_mask, True
 
     def _store_frame(self, bgr, depth):
-        """缓存当前帧为下一帧的多视图参考帧。"""
+        """缓存当前帧为下一帧的多视图参考帧，同时预热 LK 灰度图。"""
         self.prev_rgb = bgr.copy()
         self.prev_depth = depth.copy()
+        self.prev_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         self.has_prev_frame = True
