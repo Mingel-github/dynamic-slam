@@ -248,11 +248,23 @@ class MotionDetector:
             self.has_prev_frame = True
             return motion_mask, False  # 视差角全部过大 → 降级到 LK
 
-        # --- 深度差比较 → 动态种子（B1：深度自适应阈值）---
+        # --- 深度差比较（B1：深度自适应阈值）---
         u_int = np.clip(np.round(u_proj[reproj_valid][parallax_ok]).astype(int), 0, w - 1)
         v_int = np.clip(np.round(v_proj[reproj_valid][parallax_ok]).astype(int), 0, h - 1)
         z_measured = current_depth[v_int, u_int]
         z_proj_filtered = z_proj[reproj_valid][parallax_ok]
+
+        # F1: 过滤 z_measured 无效的匹配（超出量程=0 / NaN / inf）
+        measured_valid = (z_measured > self.min_valid_depth) & np.isfinite(z_measured)
+        if np.count_nonzero(measured_valid) == 0:
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
+            return motion_mask, False
+
+        z_measured = z_measured[measured_valid]
+        z_proj_filtered = z_proj_filtered[measured_valid]
+        u_int = u_int[measured_valid]
+        v_int = v_int[measured_valid]
 
         # B1: 深度自适应阈值 = 基准0.15 + Z的2%，上界0.5m
         # 近处(~1m): 0.17m, 中距离(~5m): 0.25m, 远处(≥17.5m): 0.50m
@@ -263,42 +275,31 @@ class MotionDetector:
         depth_diff = np.abs(z_proj_filtered - z_measured)
         dynamic_flags = depth_diff > adaptive_threshold
 
-        dynamic_u = u_int[dynamic_flags]
-        dynamic_v = v_int[dynamic_flags]
+        # --- F2: 深度差异图连通域分析（替代深度图 floodFill）---
+        # 原理：在 depth_diff 决定的二值图上做形态学+连通域，
+        #      代替在原始深度图上的 floodFill。
+        #      假种子(diff=8m)与真静态(diff≈0)在二值图上天然隔离，
+        #      不会像 floodFill 那样沿深度均匀面无限传播。
+        if np.count_nonzero(dynamic_flags) > 0:
+            # 1. 构建二值种子图（全分辨率）
+            seed_img = np.zeros((h, w), dtype=np.uint8)
+            seed_img[v_int[dynamic_flags], u_int[dynamic_flags]] = 255
 
-        # --- 深度一致性区域生长 ---
-        n_seeds = len(dynamic_u)
-        if n_seeds > 0:
-            floodfill_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-            clean_depth = np.nan_to_num(current_depth, nan=0.0).astype(np.float32)
+            # 2. 形态学闭运算：填充动态物体内部的小孔洞
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            seed_closed = cv2.morphologyEx(seed_img, cv2.MORPH_CLOSE, kernel_close)
 
-            # 种子数量安全上限：过多时截断取前 N 个（避免 floodFill 耗时爆炸）
-            max_seeds = 500
-            if n_seeds > max_seeds:
-                dynamic_u = dynamic_u[:max_seeds]
-                dynamic_v = dynamic_v[:max_seeds]
+            # 3. 形态学开运算：去除孤立的小噪点
+            kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            seed_clean = cv2.morphologyEx(seed_closed, cv2.MORPH_OPEN, kernel_open)
 
-            for i in range(len(dynamic_u)):
-                x_seed = int(dynamic_u[i])
-                y_seed = int(dynamic_v[i])
-
-                if not (0 <= x_seed < w and 0 <= y_seed < h):
-                    continue
-                if clean_depth[y_seed, x_seed] <= self.min_valid_depth:
-                    continue
-                if floodfill_mask[y_seed + 1, x_seed + 1] > 0:
-                    continue  # 已被之前的生长覆盖
-
-                flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY
-                cv2.floodFill(
-                    clean_depth, floodfill_mask, (x_seed, y_seed),
-                    newVal=0,
-                    loDiff=self.depth_tolerance,
-                    upDiff=self.depth_tolerance,
-                    flags=flags
-                )
-
-            motion_mask = floodfill_mask[1:-1, 1:-1]
+            # 4. 连通域分析 + 面积过滤（去除 < 50px 的残存噪点）
+            n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                seed_clean, connectivity=4)
+            min_area = 50
+            for lbl in range(1, n_labels):
+                if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+                    motion_mask[labels == lbl] = 255
 
         # 只更新多视图需要的深度缓冲，不碰 prev_gray（避免污染 LK 降级路径）
         self.prev_depth = current_depth.copy()

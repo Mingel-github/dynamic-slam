@@ -374,8 +374,14 @@ class SemanticFilterNode(Node):
             
             cv_depth[final_mask] = np.nan
 
-            debug_img[semantic_mask_np] = [0, 0, 255]       
-            debug_img[motion_mask_np > 0] = [255, 0, 0]      
+            # F5: 三层渲染 —— 红=语义 蓝=运动 紫=重叠，不再互相覆盖
+            semantic_only = semantic_mask_np & ~(motion_mask_np > 0)
+            motion_only = (motion_mask_np > 0) & ~semantic_mask_np
+            overlap = semantic_mask_np & (motion_mask_np > 0)
+
+            debug_img[semantic_only] = [0, 0, 255]        # 纯红：仅语义检测
+            debug_img[motion_only] = [255, 0, 0]           # 纯蓝：仅运动检测
+            debug_img[overlap] = [255, 0, 255]             # 紫色：语义+运动重叠      
 
             filtered_depth_msg = self.cv_bridge.cv2_to_imgmsg(cv_depth, encoding=depth_msg.encoding)
             filtered_depth_msg.header = depth_msg.header
