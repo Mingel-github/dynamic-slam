@@ -188,11 +188,19 @@ class SemanticFilterNode(Node):
         self.last_camera_pose = T_world_curr
 
         if not used_multiview:
-            # detect_multiview 因首帧等原因未产出有效结果，降级
-            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            # detect_multiview 因首帧/无有效像素等原因未产出有效结果，降级到 LK
+            try:
+                mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+            except Exception as e:
+                self.get_logger().error(
+                    f'LK+RANSAC 降级路径异常，返回空掩码: {e}',
+                    throttle_duration_sec=5.0)
+                mask = np.zeros(cv_depth.shape, dtype=np.uint8)
             self.motion_detector._store_frame(cv_img, cv_depth)
             return mask
 
+        # 多视图成功：同步 LK 灰度缓冲（detect_multiview 不再更新 prev_gray）
+        self.motion_detector._store_frame(cv_img, cv_depth)
         return motion_mask
 
     def sync_callback(self, img_msg, depth_msg, info_msg):

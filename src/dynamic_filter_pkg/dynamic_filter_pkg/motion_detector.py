@@ -137,9 +137,10 @@ class MotionDetector:
         h, w = current_depth.shape
         motion_mask = np.zeros((h, w), dtype=np.uint8)
 
-        # --- 首帧：仅缓冲，返回空掩码 ---
+        # --- 首帧：仅标记，返回空掩码（不调用 _store_frame，避免污染 prev_gray）---
         if not self.has_prev_frame:
-            self._store_frame(current_bgr, current_depth)
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
             return motion_mask, False
 
         fx = camera_intrinsics['fx']
@@ -161,7 +162,8 @@ class MotionDetector:
                  np.isfinite(z_prev))
 
         if np.count_nonzero(valid) == 0:
-            self._store_frame(current_bgr, current_depth)
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
             return motion_mask, False  # 无有效背景像素 → 降级到 LK
 
         # --- 逐像素 3D 反投影（向量化） ---
@@ -206,7 +208,8 @@ class MotionDetector:
                 f'valid_count={np.count_nonzero(valid)}, '
                 f'X_prev.shape={X_prev.shape}, u_grid.shape={u_grid.shape}',
                 file=sys.stderr)
-            self._store_frame(current_bgr, current_depth)
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
             return motion_mask, False
 
         P_curr = (R @ P_prev.T + t.reshape(3, 1)).T  # (N,3)
@@ -224,7 +227,8 @@ class MotionDetector:
         )
 
         if np.count_nonzero(reproj_valid) == 0:
-            self._store_frame(current_bgr, current_depth)
+            self.prev_depth = current_depth.copy()
+            self.has_prev_frame = True
             return motion_mask, False  # 无有效重投影 → 降级到 LK
 
         # --- 深度差比较 → 动态种子 ---
@@ -272,7 +276,9 @@ class MotionDetector:
 
             motion_mask = floodfill_mask[1:-1, 1:-1]
 
-        self._store_frame(current_bgr, current_depth)
+        # 只更新多视图需要的深度缓冲，不碰 prev_gray（避免污染 LK 降级路径）
+        self.prev_depth = current_depth.copy()
+        self.has_prev_frame = True
         return motion_mask, True
 
     def _store_frame(self, bgr, depth):
