@@ -88,6 +88,11 @@ class SemanticFilterNode(Node):
         self.debug_pub = self.create_publisher(Image, '/camera/image_debug', 10)
         self.track_pub = self.create_publisher(MarkerArray, '/pedestrian_tracks', 10)
 
+        # P3-③: 独立 debug topic — 三个掩码分量分开发布，rqt 多窗口独立观察
+        self.semantic_debug_pub = self.create_publisher(Image, '/camera/semantic_mask', 10)
+        self.motion_debug_pub = self.create_publisher(Image, '/camera/motion_mask', 10)
+        self.final_debug_pub = self.create_publisher(Image, '/camera/final_mask', 10)
+
     # ========================================================================
     #  P1: 里程计回调 + 帧间位姿计算
     # ========================================================================
@@ -190,6 +195,7 @@ class SemanticFilterNode(Node):
             mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
             self.motion_detector._store_frame(cv_img, cv_depth)
             self.last_camera_pose = None  # 位姿不连续，重置多视图状态
+            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
             return mask
 
         # --- 主路径：多视图深度重投影 ---
@@ -216,6 +222,7 @@ class SemanticFilterNode(Node):
             mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
             self.motion_detector._store_frame(cv_img, cv_depth)
             self.last_camera_pose = None
+            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
             return mask
 
         camera_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
@@ -229,6 +236,7 @@ class SemanticFilterNode(Node):
             mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
             self.motion_detector._store_frame(cv_img, cv_depth)
             self.last_camera_pose = None  # 多视图状态不一致，重置
+            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
             return mask
 
         # 持久化当前帧位姿供下一帧使用
@@ -390,6 +398,21 @@ class SemanticFilterNode(Node):
             debug_msg = self.cv_bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
             debug_msg.header = img_msg.header
             self.debug_pub.publish(debug_msg)
+
+            # P3-③: 独立 debug topic — 三个掩码分量分开发布
+            semantic_msg = self.cv_bridge.cv2_to_imgmsg(
+                semantic_mask_np.astype(np.uint8) * 255, encoding='mono8')
+            semantic_msg.header = img_msg.header
+            self.semantic_debug_pub.publish(semantic_msg)
+
+            motion_msg = self.cv_bridge.cv2_to_imgmsg(motion_mask_np, encoding='mono8')
+            motion_msg.header = img_msg.header
+            self.motion_debug_pub.publish(motion_msg)
+
+            final_mask_uint8 = final_mask.astype(np.uint8) * 255
+            final_msg = self.cv_bridge.cv2_to_imgmsg(final_mask_uint8, encoding='mono8')
+            final_msg.header = img_msg.header
+            self.final_debug_pub.publish(final_msg)
             
             self.track_pub.publish(marker_array)
 

@@ -25,14 +25,21 @@ class MotionDetector:
         self.prev_depth = None
         self.has_prev_frame = False
 
+        # P3-①: 时序一致性投票状态（EMA 滑动窗口）
+        self.dynamic_votes = None  # (H,W) float32，每像素动态票数
+
     def detect(self, current_bgr, current_depth, semantic_mask):
         current_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
         h, w = current_gray.shape
         motion_mask = np.zeros((h, w), dtype=np.uint8)
 
         # 1. 屏蔽区生成：将已知语义目标（人）所在的区域设为 0，避免在行人身上提取运动特征点
+        # P3-②: 膨胀 semantic_mask 15px 保护带，覆盖遮挡/去遮挡边界
         if semantic_mask is not None and semantic_mask.any():
-            valid_bg_mask = np.where(semantic_mask, 0, 255).astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            semantic_dilated = cv2.dilate(
+                semantic_mask.astype(np.uint8), kernel).astype(bool)
+            valid_bg_mask = np.where(semantic_dilated, 0, 255).astype(np.uint8)
         else:
             valid_bg_mask = np.ones((h, w), dtype=np.uint8) * 255
 
@@ -149,9 +156,12 @@ class MotionDetector:
         cx = camera_intrinsics['cx']
         cy = camera_intrinsics['cy']
 
-        # --- 背景像素掩码：排除已知语义动态区域 ---
+        # --- 背景像素掩码：排除已知语义动态区域（P3-② 膨胀保护带）---
         if semantic_mask is not None and semantic_mask.any():
-            bg_mask = ~semantic_mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            semantic_dilated = cv2.dilate(
+                semantic_mask.astype(np.uint8), kernel).astype(bool)
+            bg_mask = ~semantic_dilated
         else:
             bg_mask = np.ones((h, w), dtype=bool)
 
@@ -275,15 +285,29 @@ class MotionDetector:
         depth_diff = np.abs(z_proj_filtered - z_measured)
         dynamic_flags = depth_diff > adaptive_threshold
 
-        # --- F2: 深度差异图连通域分析（替代深度图 floodFill）---
-        # 原理：在 depth_diff 决定的二值图上做形态学+连通域，
-        #      代替在原始深度图上的 floodFill。
-        #      假种子(diff=8m)与真静态(diff≈0)在二值图上天然隔离，
-        #      不会像 floodFill 那样沿深度均匀面无限传播。
+        # --- P3-①: 时序一致性投票（EMA 滑动窗口）---
+        # 原理：单帧 depth_diff 对均匀深度+横向运动的物体存在盲区（箱子内部 ~80% 面积 diff≈0），
+        #      但物体边缘在部分帧中能被检测到。EMA 投票让边缘证据"延续"到后续帧，
+        #      模拟 DynaSLAM 多关键帧投票效果，不增加计算开销。
+        if self.dynamic_votes is None:
+            self.dynamic_votes = np.zeros((h, w), dtype=np.float32)
+
+        # 当前帧动态种子 → 投票 +1
+        current_votes = np.zeros((h, w), dtype=np.float32)
         if np.count_nonzero(dynamic_flags) > 0:
-            # 1. 构建二值种子图（全分辨率）
+            current_votes[v_int[dynamic_flags], u_int[dynamic_flags]] = 1.0
+
+        # EMA: 新票 = 0.8×旧票 + 0.2×新票（时间常数 ≈ 5 帧）
+        self.dynamic_votes = 0.8 * self.dynamic_votes + 0.2 * current_votes
+
+        # 票数 > 0.15 → 动态（等价于最近 ~5 帧内 ≥2 帧检测到）
+        vote_mask = self.dynamic_votes > 0.15
+
+        # --- F2: 深度差异图连通域分析（种子改为投票掩码）---
+        if np.count_nonzero(vote_mask) > 0:
+            # 1. 构建二值种子图（vote_mask 已是全分辨率布尔数组）
             seed_img = np.zeros((h, w), dtype=np.uint8)
-            seed_img[v_int[dynamic_flags], u_int[dynamic_flags]] = 255
+            seed_img[vote_mask] = 255
 
             # 2. 形态学闭运算：填充动态物体内部的小孔洞
             kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
