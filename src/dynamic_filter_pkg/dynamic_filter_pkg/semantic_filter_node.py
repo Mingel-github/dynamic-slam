@@ -93,6 +93,9 @@ class SemanticFilterNode(Node):
         self.motion_debug_pub = self.create_publisher(Image, '/camera/motion_mask', 10)
         self.final_debug_pub = self.create_publisher(Image, '/camera/final_mask', 10)
 
+        # P4: RGB域动态过滤 — 动态区域涂黑后发给 RTAB-Map，阻止ORB特征提取
+        self.rgb_filtered_pub = self.create_publisher(Image, '/camera/image_filtered', 10)
+
     # ========================================================================
     #  P1: 里程计回调 + 帧间位姿计算
     # ========================================================================
@@ -394,6 +397,15 @@ class SemanticFilterNode(Node):
             filtered_depth_msg = self.cv_bridge.cv2_to_imgmsg(cv_depth, encoding=depth_msg.encoding)
             filtered_depth_msg.header = depth_msg.header
             self.depth_pub.publish(filtered_depth_msg)
+
+            # P4: RGB域动态过滤 — 动态区域涂黑，阻止RTAB-Map在动态物体上提取ORB特征
+            # DYR-SLAM 参照: "all RGB images and depth images that remove dynamic
+            # objects are transmitted to the RTAB-Map system"
+            rgb_filtered = cv_img.copy()
+            rgb_filtered[final_mask] = 0  # 动态像素→黑色(无纹理→无ORB特征)
+            rgb_filtered_msg = self.cv_bridge.cv2_to_imgmsg(rgb_filtered, encoding='bgr8')
+            rgb_filtered_msg.header = img_msg.header
+            self.rgb_filtered_pub.publish(rgb_filtered_msg)
 
             debug_msg = self.cv_bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
             debug_msg.header = img_msg.header

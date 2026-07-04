@@ -55,8 +55,8 @@ def generate_launch_description():
             'visual_odometry': 'false',             
             'odom_topic': '/odom',                  
             
-            'rgb_topic': '/camera/image_raw',
-            'depth_topic': '/camera/depth/image_filtered', #/camera/depth/image_raw
+            'rgb_topic': '/camera/image_filtered',  # P4: 订阅过滤后RGB，阻止动态物体上的ORB特征
+            'depth_topic': '/camera/depth/image_filtered',
             'camera_info_topic': '/camera/camera_info',
             'scan_cloud_topic': '/points_raw',      
             
