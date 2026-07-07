@@ -1,12 +1,11 @@
 """
 P7: 非语义动态物体追踪与状态估计。
 
-闭环流水线:
+流水线:
   ① 实例提取: final_mask → 连通域 → 3D 反投影 → 世界坐标质心
   ② 匈牙利数据关联: M×N 距离矩阵 → 匹配/新生/丢失
   ③ Kalman 追踪: 状态 [x,y,z,vx,vy,vz], 预测→更新→平滑 → 速度+轨迹
-  ④ 追踪反哺检测: Kalman 预测 → 投影到图像 → 漏检时补掩码
-  ⑤ RViz2 可视化: /tracked_objects (MarkerArray: 位置框+速度箭头+轨迹线)
+  ④ RViz2 可视化: /tracked_objects (MarkerArray: 位置框+速度箭头+轨迹线+标签)
 
 参考: DynaSLAM II (紧耦合 Joint BA 追踪)、DetectFusion (松耦合预处理层追踪)
 """
@@ -126,12 +125,11 @@ class ObjectTracker:
     """
     P7: 统一动态物体追踪器（方案A）。
 
-    同时处理语义检测（YOLO person）和几何检测（P5+P6 box），
+    同时处理语义检测（YOLO person）和几何检测（P5 box），
     统一经匈牙利数据关联 + Kalman 平滑 → 统一 RViz2 可视化。
 
     - 不依赖 SLAM 后端
     - 纯 3D 质心距离匈牙利关联（非密集场景下区分度 >100×）
-    - 追踪反馈闭环（预测补漏检）
     - 统一速度箭头 + 轨迹渐变 + 类别标签
     """
 
@@ -181,14 +179,12 @@ class ObjectTracker:
         feedback_mask = np.zeros((h, w), dtype=np.uint8)
 
         # ---- ① 实例提取 ----
-        # 内部: 从运动掩码提取非语义实例（箱子等）
-        detections = self._extract_instances(
-            motion_mask, depth_image, fx, fy, cx, cy, T_world_cam)
-
-        # 外部: 合并 YOLO 语义检测（行人）
+        # 仅追踪 YOLO 语义检测（行人）。P5 几何检测的假阳性残留会导致
+        # 大量虚空 TrackedObject, 几何检测仅负责产生掩码（涂黑），不追踪。
+        detections = []
         if external_detections:
             for ext_det in external_detections:
-                ext_det['_source'] = 'semantic'  # 标记来源
+                ext_det['_source'] = 'semantic'
                 detections.append(ext_det)
 
         # ---- ② 预测所有现有追踪到当前帧 ----
@@ -225,43 +221,7 @@ class ObjectTracker:
         for tid in lost_ids:
             del self.tracks[tid]
 
-        # ---- ⑦ 追踪反哺检测: 对活跃但本帧未匹配的追踪，预测其掩码 ----
-        active_unmatched = [
-            t for t in self.tracks.values()
-            if t.is_active and t.frames_since_seen > 0 and t.last_bbox is not None
-        ]
-        for track in active_unmatched:
-            pred_pos = track.kf.position  # 世界坐标预测位置
-            # 反变换: 世界 → 相机
-            T_cam_world = np.linalg.inv(T_world_cam)
-            pos_cam = T_cam_world[:3, :3] @ pred_pos + T_cam_world[:3, 3]
-
-            if not np.isfinite(pos_cam[2]) or pos_cam[2] <= 0.1:
-                continue  # NaN/Inf 或 在相机后方
-
-            # 投影到图像
-            u_pred = int(fx * pos_cam[0] / pos_cam[2] + cx)
-            v_pred = int(fy * pos_cam[1] / pos_cam[2] + cy)
-
-            # 以预测位置为中心，用历史 bbox 尺寸画预测区域
-            bx, by, bw, bh = track.last_bbox
-            half_w, half_h = max(bw // 2, 10), max(bh // 2, 10)
-            u1 = max(0, u_pred - half_w)
-            v1 = max(0, v_pred - half_h)
-            u2 = min(w, u_pred + half_w)
-            v2 = min(h, v_pred + half_h)
-
-            # 检查预测区域内是否已有运动检测
-            roi = motion_mask[v1:v2, u1:u2]
-            if roi.size == 0:
-                continue
-
-            detection_ratio = np.count_nonzero(roi) / max(roi.size, 1)
-            if detection_ratio < 0.05:
-                # 漏检: 在预测区域补上掩码
-                cv2.rectangle(feedback_mask, (u1, v1), (u2, v2), 255, -1)
-
-        # ---- ⑧ 构建输出 ----
+        # ---- 构建输出 ----
         tracked_objects = []
         markers = []
 

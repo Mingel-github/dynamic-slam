@@ -11,7 +11,7 @@ class MotionDetector:
         :param min_displacement: 判定为动态外点的最小像素位移（过滤背景微小抖动）
         :param depth_tolerance: FloodFill 深度生长的容忍度（米）
         :param reprojection_threshold: 多视图深度重投影的基础判定阈值（米）。
-               实际采用深度自适应: max(0.15, min(0.5, base + 0.02*Z))，参考 DynaSLAM τ_z=0.4m。
+               实际采用深度自适应: max(0.15, min(0.5, base + 0.02*Z))。DynaSLAM源码硬编码0.6m(Geometry.cc:351), 论文优化为0.4m。
         :param min_valid_depth: 参与多视图运算的最小有效深度（米）
         :param cluster_depth_threshold: P5 深度聚类相邻像素最大深度差（米），默认5cm
         :param cluster_min_size: P5 聚类最小像素数，默认100
@@ -137,7 +137,11 @@ class MotionDetector:
         return motion_mask
 
     # ========================================================================
-    #  P1: 多视图几何一致性检测（深度重投影法）
+    #  P1: 多视图几何一致性检测（深度重投影法）— @deprecated
+    #
+    #  已被 P5 (detect_clustering) 取代。保留代码仅供对照参考。
+    #  P5 替代原因: 逐像素 SNR=0.12 不可检测慢速物体(2.5cm/帧),
+    #  而聚类 √N 降噪将 SNR 提升至 21。
     # ========================================================================
 
     def detect_multiview(self, current_bgr, current_depth, semantic_mask,
@@ -437,9 +441,18 @@ class MotionDetector:
             dynamic_indices = self._match_and_detect(
                 curr_clusters_3d, self.prev_clusters_3d)
 
+            # 收集动态簇的像素作为区域生长种子
+            seed_mask = np.zeros((h, w), dtype=bool)
             for idx in dynamic_indices:
                 if idx < len(curr_clusters_3d):
-                    cluster_mask[curr_clusters_3d[idx]['mask']] = 255
+                    seed_mask |= curr_clusters_3d[idx]['mask']
+
+            # Step 5: 深度区域生长 — 稀疏种子 → 完整物体掩码
+            # 参考 DynaSLAM DepthRegionGrowing() (Geometry.cc:393-428):
+            #   mSegThreshold=0.20, 4-邻域传播
+            if seed_mask.any():
+                cluster_mask = self._region_growing(
+                    current_depth, seed_mask, tolerance=0.15)
 
         # 持久化当前帧聚类供下一帧匹配（不含mask，节省内存）
         self.prev_clusters_3d = [
@@ -534,11 +547,20 @@ class MotionDetector:
         X = (cs_in - cx) * depths_in / fx
         Y = (rs_in - cy) * depths_in / fy
 
+        # 方差过滤: 排除深度不连续处的簇（物体边缘、地板、远处走廊）
+        # 参考 DynaSLAM Geometry.cc:371-372 — mVarThreshold = 0.001
+        # 即局部深度方差 < 0.001 → 平坦表面，确认可靠
+        # 方差 > 0.01 → 簇跨越深度跳变（如墙壁边缘、地板）→ 跳过
+        depth_var = float(np.var(depths_in))
+        if depth_var > 0.01:
+            return None
+
         return {
             'centroid_3d': np.array([np.mean(X), np.mean(Y), np.mean(depths_in)]),
             'depth_mean': float(np.mean(depths_in)),
             'depth_std': float(np.std(depths_in)),
             'pixel_count': len(depths_in),
+            'depth_var': depth_var,
         }
 
     def _match_and_detect(self, curr_clusters, prev_clusters):
@@ -594,11 +616,57 @@ class MotionDetector:
             sigma_cluster = depth_std / np.sqrt(max(n_pixels, 1))
             threshold_3sigma = self.cluster_motion_sigma * sigma_cluster
 
-            # 世界坐标下动态判定: 3D 位移超过 3σ_cluster
-            if d3d > max(threshold_3sigma, 0.005):  # 至少 0.5cm
+            # 世界坐标下动态判定: 3D 位移超过 max(2cm, 3σ/√N)
+            # 自适应阈值: 1) √N降噪保证极低噪声→检测微弱信号
+            #            2) 2cm最低门槛→过滤簇边界偏移(0.5-1.5cm)
+            #            3) 箱子2.5cm/帧 > 2cm → 检出, 2cm margin≈直径
+            if d3d > max(threshold_3sigma, 0.02):
                 dynamic_indices.add(i)
 
         return dynamic_indices
+
+    def _region_growing(self, depth_image, seed_mask, tolerance=0.15):
+        """
+        深度区域生长：从动态种子沿深度连通区域传播 → 完整物体掩码。
+
+        参考 DynaSLAM Geometry.cc:1020-1061 RegionGrowing():
+          4-邻域传播, 相邻像素 |depth - seed_depth| < tolerance → 合并
+          mSegThreshold = 0.20 (DynaSLAM), 我们使用 0.15m (更保守)
+
+        :param depth_image: (H,W) float32 深度图
+        :param seed_mask:   (H,W) bool 动态种子掩码
+        :param tolerance:   深度差容忍（米），默认 0.15
+        :return:            (H,W) uint8 区域生长后的动态掩码
+        """
+        from collections import deque
+
+        h, w = depth_image.shape
+        grown = seed_mask.copy().astype(np.uint8)
+        visited = seed_mask.copy()
+
+        # 4-邻域
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        # 将所有种子像素入队
+        queue = deque()
+        seed_ys, seed_xs = np.where(seed_mask)
+        for y, x in zip(seed_ys, seed_xs):
+            if depth_image[y, x] > 0.1 and np.isfinite(depth_image[y, x]):
+                queue.append((y, x, depth_image[y, x]))
+
+        while queue:
+            y, x, ref_depth = queue.popleft()
+            for dy, dx in neighbors:
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                    d = depth_image[ny, nx]
+                    if d > 0.1 and np.isfinite(d):
+                        if abs(d - ref_depth) < tolerance:
+                            grown[ny, nx] = 255
+                            visited[ny, nx] = True
+                            queue.append((ny, nx, ref_depth))
+
+        return grown
 
     @staticmethod
     def _greedy_assign(cost_matrix):

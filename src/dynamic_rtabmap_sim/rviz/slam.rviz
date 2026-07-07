@@ -172,6 +172,49 @@ Visualization Manager:
                   {}
       Update Interval: 0
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Tracked Objects
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /tracked_objects
+      Value: true
+    - Class: rviz_default_plugins/Odometry
+      Enabled: true
+      Keep: 10000
+      Name: Odometry
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /odom
+      Value: true
+      Color: 150; 150; 150
+      Alpha: 0.7
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Map Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rtabmap/mapPath
+      Value: true
+      Color: 0; 255; 0
+      Alpha: 0.8
+      Buffer Length: 1
+      Line Style: Lines
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
     - Alpha: 0.699999988079071
       Class: rviz_default_plugins/Map
       Color Scheme: map
