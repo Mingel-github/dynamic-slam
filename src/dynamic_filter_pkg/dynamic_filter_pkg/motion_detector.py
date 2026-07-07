@@ -3,7 +3,9 @@ import numpy as np
 
 class MotionDetector:
     def __init__(self, max_corners=300, min_displacement=2.0, depth_tolerance=0.15,
-                 reprojection_threshold=0.15, min_valid_depth=0.1):
+                 reprojection_threshold=0.15, min_valid_depth=0.1,
+                 cluster_depth_threshold=0.05, cluster_min_size=100,
+                 cluster_match_max_dist=0.3, cluster_motion_sigma=3.0):
         """
         :param max_corners: LK光流追踪的最大角点数
         :param min_displacement: 判定为动态外点的最小像素位移（过滤背景微小抖动）
@@ -11,6 +13,10 @@ class MotionDetector:
         :param reprojection_threshold: 多视图深度重投影的基础判定阈值（米）。
                实际采用深度自适应: max(0.15, min(0.5, base + 0.02*Z))，参考 DynaSLAM τ_z=0.4m。
         :param min_valid_depth: 参与多视图运算的最小有效深度（米）
+        :param cluster_depth_threshold: P5 深度聚类相邻像素最大深度差（米），默认5cm
+        :param cluster_min_size: P5 聚类最小像素数，默认100
+        :param cluster_match_max_dist: P5 帧间簇匹配最大3D距离（米），默认0.3
+        :param cluster_motion_sigma: P5 簇运动判定的sigma倍数，默认3.0
         """
         self.max_corners = max_corners
         self.min_displacement = min_displacement
@@ -27,6 +33,13 @@ class MotionDetector:
 
         # P3-①: 时序一致性投票状态（EMA 滑动窗口）
         self.dynamic_votes = None  # (H,W) float32，每像素动态票数
+
+        # P5: 深度聚类检测状态
+        self.cluster_depth_threshold = cluster_depth_threshold
+        self.cluster_min_size = cluster_min_size
+        self.cluster_match_max_dist = cluster_match_max_dist
+        self.cluster_motion_sigma = cluster_motion_sigma
+        self.prev_clusters_3d = None  # 上一帧的聚类列表
 
     def detect(self, current_bgr, current_depth, semantic_mask):
         current_gray = cv2.cvtColor(current_bgr, cv2.COLOR_BGR2GRAY)
@@ -336,3 +349,279 @@ class MotionDetector:
         self.prev_depth = depth.copy()
         self.prev_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         self.has_prev_frame = True
+
+    # ========================================================================
+    #  P5: 深度聚类检测（√N 降噪，替代逐像素深度重投影）
+    # ========================================================================
+
+    def detect_clustering(self, current_depth, camera_intrinsics, semantic_mask=None,
+                          T_world_cam=None):
+        """
+        P5: 深度聚类运动检测。
+
+        原理: 将判断单元从"1个像素"提升为"1个物体簇"，利用 √N 降噪。
+              逐像素 SNR ≈ 0.12（不可检测），逐聚类 SNR ≈ 21（高度可靠）。
+
+        步骤:
+          1. 深度图区域生长聚类（相邻像素深度差 < 5cm → 同一簇）
+          2. 3D 质心计算（反投影到相机坐标 → 转到世界坐标）
+          3. 帧间簇关联（匈牙利算法，世界坐标 3D 质心最近邻）
+          4. 簇运动判断（|Δd_world| > 3σ_cluster → 动态）
+          5. 动态簇 → 掩码输出
+
+        参考: DetectFusion (2019) — 松耦合预处理层使用世界坐标 ICP 聚类
+              DynaSLAM (2018) — 多视图重投影前先消除相机自运动
+
+        :param current_depth:    当前帧深度图 (H,W) float32
+        :param camera_intrinsics: dict {'fx','fy','cx','cy'}
+        :param semantic_mask:    已知动态区域布尔掩码 (H,W)，这些像素不参与检测
+        :param T_world_cam:      (4,4) 相机→世界齐次变换矩阵，None则用单位阵（首帧）
+        :return: cluster_mask (H,W) uint8
+        """
+        h, w = current_depth.shape
+        fx = camera_intrinsics['fx']
+        fy = camera_intrinsics['fy']
+        cx = camera_intrinsics['cx']
+        cy = camera_intrinsics['cy']
+
+        if T_world_cam is None:
+            T_world_cam = np.eye(4, dtype=np.float64)
+
+        cluster_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # --- 构建有效深度掩码 ---
+        valid_depth = (current_depth > self.min_valid_depth) & np.isfinite(current_depth)
+
+        # 排除语义已知动态区域（膨胀保护带）
+        if semantic_mask is not None and semantic_mask.any():
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+            semantic_dilated = cv2.dilate(
+                semantic_mask.astype(np.uint8), kernel).astype(bool)
+            valid_depth = valid_depth & ~semantic_dilated
+
+        if np.count_nonzero(valid_depth) < self.cluster_min_size:
+            self.prev_clusters_3d = None
+            return cluster_mask
+
+        # --- Step 1: 深度聚类提取 ---
+        clusters, _ = self._extract_depth_clusters(current_depth, valid_depth)
+
+        if len(clusters) == 0:
+            self.prev_clusters_3d = None
+            return cluster_mask
+
+        # --- Step 2: 计算每个簇的 3D 质心（相机坐标 → 世界坐标）---
+        # 参考: DetectFusion (2019) 松耦合预处理层使用世界坐标聚类
+        #       DynaSLAM (2018) 多视图重投影前先消除相机自运动
+        curr_clusters_3d = []
+        for cluster in clusters:
+            info_3d = self._compute_cluster_3d(
+                cluster['mask'], current_depth, fx, fy, cx, cy)
+            if info_3d is not None:
+                # 相机坐标 → 世界坐标
+                centroid_cam = info_3d['centroid_3d']
+                centroid_homo = np.array([centroid_cam[0], centroid_cam[1],
+                                          centroid_cam[2], 1.0], dtype=np.float64)
+                centroid_world = (T_world_cam @ centroid_homo)[:3]
+                info_3d['centroid_world'] = centroid_world
+                info_3d['mask'] = cluster['mask']
+                info_3d['bbox'] = cluster['bbox']
+                curr_clusters_3d.append(info_3d)
+
+        if len(curr_clusters_3d) == 0:
+            self.prev_clusters_3d = None
+            return cluster_mask
+
+        # --- Step 3-4: 帧间匹配 + 运动判定 ---
+        if self.prev_clusters_3d is not None and len(self.prev_clusters_3d) > 0:
+            dynamic_indices = self._match_and_detect(
+                curr_clusters_3d, self.prev_clusters_3d)
+
+            for idx in dynamic_indices:
+                if idx < len(curr_clusters_3d):
+                    cluster_mask[curr_clusters_3d[idx]['mask']] = 255
+
+        # 持久化当前帧聚类供下一帧匹配（不含mask，节省内存）
+        self.prev_clusters_3d = [
+            {k: v for k, v in c.items() if k != 'mask'}
+            for c in curr_clusters_3d
+        ]
+
+        return cluster_mask
+
+    def _extract_depth_clusters(self, depth, valid_mask):
+        """
+        使用深度梯度边界 + 连通域分析提取深度一致的区域。
+
+        方法: Sobel梯度幅值 → 阈值化找到深度边界 → 反转得到内部区域
+              → 膨胀回收边界像素 → 连通域标记 → 面积过滤。
+
+        :return: (clusters_list, labels_image)
+        """
+        h, w = depth.shape
+        depth_clean = np.where(valid_mask, depth, 0.0).astype(np.float32)
+
+        # 计算深度梯度幅值
+        grad_x = cv2.Sobel(depth_clean, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(depth_clean, cv2.CV_32F, 0, 1, ksize=3)
+        grad_mag = np.sqrt(grad_x**2 + grad_y**2)
+
+        # 深度边界: 梯度 > 聚类阈值（默认 5cm/px）
+        edge_mask = grad_mag > self.cluster_depth_threshold
+
+        # 内部区域: 有效深度 且 非边界
+        interior = valid_mask & ~edge_mask
+
+        # 膨胀回收边界像素（把被标记为边界的物体表面像素拉回簇内）
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        interior_dilated = cv2.dilate(
+            interior.astype(np.uint8), kernel, iterations=1)
+        cluster_region = (interior_dilated > 0) & valid_mask
+
+        # 连通域分析
+        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            cluster_region.astype(np.uint8), connectivity=4)
+
+        # 提取簇信息，过滤小碎片
+        clusters = []
+        for lbl in range(1, n_labels):
+            area = stats[lbl, cv2.CC_STAT_AREA]
+            if area >= self.cluster_min_size:
+                clusters.append({
+                    'id': len(clusters),
+                    'mask': labels == lbl,
+                    'area': area,
+                    'bbox': (stats[lbl, cv2.CC_STAT_LEFT],
+                             stats[lbl, cv2.CC_STAT_TOP],
+                             stats[lbl, cv2.CC_STAT_WIDTH],
+                             stats[lbl, cv2.CC_STAT_HEIGHT]),
+                    'centroid_2d': (centroids[lbl][0], centroids[lbl][1])
+                })
+
+        return clusters, labels
+
+    def _compute_cluster_3d(self, cluster_mask, depth, fx, fy, cx, cy):
+        """
+        计算一个簇的 3D 质心和统计量。
+
+        使用 MAD (Median Absolute Deviation) 过滤深度离群值，
+        然后反投影到相机坐标系计算 3D 质心。
+
+        :return: dict with centroid_3d, depth_mean, depth_std, pixel_count
+                 或 None（如果有效像素不足）
+        """
+        depths = depth[cluster_mask]
+
+        if len(depths) < 10:
+            return None
+
+        # MAD 离群值过滤（比 z-score 更鲁棒）
+        d_median = np.median(depths)
+        d_mad = np.median(np.abs(depths - d_median))
+        d_std_est = 1.4826 * max(d_mad, 1e-4)  # MAD → σ 估计
+        inlier = np.abs(depths - d_median) < 3.0 * d_std_est
+
+        depths_in = depths[inlier]
+        if len(depths_in) < 10:
+            return None
+
+        # 获取像素坐标
+        rs, cs_array = np.where(cluster_mask)
+        rs_in = rs[inlier]
+        cs_in = cs_array[inlier]
+
+        # 反投影到 3D 相机坐标
+        X = (cs_in - cx) * depths_in / fx
+        Y = (rs_in - cy) * depths_in / fy
+
+        return {
+            'centroid_3d': np.array([np.mean(X), np.mean(Y), np.mean(depths_in)]),
+            'depth_mean': float(np.mean(depths_in)),
+            'depth_std': float(np.std(depths_in)),
+            'pixel_count': len(depths_in),
+        }
+
+    def _match_and_detect(self, curr_clusters, prev_clusters):
+        """
+        帧间簇匹配（匈牙利算法）+ 运动判定（世界坐标系）。
+
+        世界坐标系下，相机自运动已消除，静态簇质心不变（|Δd| ≈ 0），
+        仅真正在世界中运动的物体产生 |Δd| > 3σ_cluster。
+
+        σ_cluster = depth_std / √N（聚类 √N 降噪）
+
+        :return: set of indices into curr_clusters that are dynamic
+        """
+        M = len(curr_clusters)
+        N = len(prev_clusters)
+
+        if M == 0 or N == 0:
+            return set()
+
+        # 构建 M×N 距离矩阵（世界坐标 3D 质心距离）
+        cost = np.full((M, N), np.inf, dtype=np.float64)
+        for i in range(M):
+            ci = curr_clusters[i].get('centroid_world')
+            if ci is None or not np.all(np.isfinite(ci)):
+                continue
+            for j in range(N):
+                pj = prev_clusters[j].get('centroid_world')
+                if pj is None or not np.all(np.isfinite(pj)):
+                    continue
+                cost[i, j] = float(np.linalg.norm(ci - pj))
+
+        # 匈牙利匹配
+        try:
+            from scipy.optimize import linear_sum_assignment
+            row_ind, col_ind = linear_sum_assignment(cost)
+        except ImportError:
+            row_ind, col_ind = self._greedy_assign(cost)
+
+        # 逐对运动判定
+        dynamic_indices = set()
+        max_dist = self.cluster_match_max_dist
+
+        for i, j in zip(row_ind, col_ind):
+            if cost[i, j] >= max_dist:
+                continue
+
+            # 世界坐标 3D 位移（静态物体≈0，仅传感器噪声）
+            d3d = float(cost[i, j])
+
+            # √N 降噪: σ_cluster = σ_depth / √N
+            n_pixels = curr_clusters[i].get('pixel_count', 1)
+            depth_std = curr_clusters[i].get('depth_std', 0.01)
+            sigma_cluster = depth_std / np.sqrt(max(n_pixels, 1))
+            threshold_3sigma = self.cluster_motion_sigma * sigma_cluster
+
+            # 世界坐标下动态判定: 3D 位移超过 3σ_cluster
+            if d3d > max(threshold_3sigma, 0.005):  # 至少 0.5cm
+                dynamic_indices.add(i)
+
+        return dynamic_indices
+
+    @staticmethod
+    def _greedy_assign(cost_matrix):
+        """
+        贪心分配算法（scipy 不可用时的回退方案）。
+
+        每次取距离矩阵中最小值对应的配对，然后移除该行和列。
+        适用于小矩阵（典型场景 M,N < 20）。
+        """
+        cost = cost_matrix.copy()
+        M, N = cost.shape
+        row_ind = []
+        col_ind = []
+
+        for _ in range(min(M, N)):
+            if np.all(np.isinf(cost)):
+                break
+            min_idx = np.unravel_index(np.argmin(cost), cost.shape)
+            if np.isinf(cost[min_idx]):
+                break
+            row_ind.append(int(min_idx[0]))
+            col_ind.append(int(min_idx[1]))
+            cost[min_idx[0], :] = np.inf
+            cost[:, min_idx[1]] = np.inf
+
+        return np.array(row_ind, dtype=int), np.array(col_ind, dtype=int)

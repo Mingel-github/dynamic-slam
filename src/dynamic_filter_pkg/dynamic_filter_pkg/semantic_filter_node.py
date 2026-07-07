@@ -5,7 +5,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image, CameraInfo
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
 from cv_bridge import CvBridge
 import message_filters
 from rclpy.qos import qos_profile_sensor_data
@@ -20,8 +19,8 @@ from ultralytics import YOLO
 
 # 引入光流运动引擎
 from .motion_detector import MotionDetector
-# P2: Kalman 追踪器
-from .kalman_tracker import KalmanFilter3D, TrackState
+# P7: 统一物体追踪器（行人+非语义物体，匈牙利+Kalman统一流水线）
+from .object_tracker import ObjectTracker
 
 class SemanticFilterNode(Node):
     def __init__(self):
@@ -48,18 +47,13 @@ class SemanticFilterNode(Node):
         self.motion_detector = MotionDetector(max_corners=300, min_displacement=2.0, depth_tolerance=0.15)
         self.get_logger().info('LK光流与深度生长引擎 初始化成功')
 
-        # [新增] 轨迹记忆字典与最大长度限制
-        self.track_history = {}   # 格式: {track_id: [(X, Y, Z), ...]}
-        self.max_history_len = 50 # 贪吃蛇的长度，保存过去 50 个点
+        # P7: 初始化统一物体追踪器（行人+箱子，匈牙利+Kalman统一流水线）
+        self.object_tracker = ObjectTracker(
+            match_max_dist=0.5, min_confirm=3, max_lost=10)
+        self.get_logger().info('P7 统一物体追踪器 初始化成功')
 
-        # P2: Kalman Filter 池 — 每个 track_id 对应一个 KF 实例
-        self.kf_pool: dict[int, KalmanFilter3D] = {}
-
-        # P1: 里程计订阅 — 用于多视图几何一致性的帧间位姿
+        # 里程计缓存 — 用于相机世界位姿（追踪坐标转换）
         self.latest_odom = None
-        self.latest_odom_time = None
-        self.last_camera_pose = None   # 上一帧的相机位姿 (4,4) 齐次矩阵
-        self.pose_timeout = 0.1        # 里程计超时阈值（秒），30Hz odom 容忍~3帧丢失
 
         # P1: TF — 获取 camera_link_optical 在世界帧中的真实位姿
         self.tf_buffer = tf2_ros.Buffer()
@@ -86,15 +80,17 @@ class SemanticFilterNode(Node):
         # 3. 设置发布器
         self.depth_pub = self.create_publisher(Image, '/camera/depth/image_filtered', 10)
         self.debug_pub = self.create_publisher(Image, '/camera/image_debug', 10)
-        self.track_pub = self.create_publisher(MarkerArray, '/pedestrian_tracks', 10)
+        self.track_pub = self.create_publisher(MarkerArray, '/dynamic_tracks', 10)
 
-        # P3-③: 独立 debug topic — 三个掩码分量分开发布，rqt 多窗口独立观察
-        self.semantic_debug_pub = self.create_publisher(Image, '/camera/semantic_mask', 10)
-        self.motion_debug_pub = self.create_publisher(Image, '/camera/motion_mask', 10)
+        # 精简 debug topic: 仅保留关键掩码用于验证过滤效果
         self.final_debug_pub = self.create_publisher(Image, '/camera/final_mask', 10)
 
         # P4: RGB域动态过滤 — 动态区域涂黑后发给 RTAB-Map，阻止ORB特征提取
         self.rgb_filtered_pub = self.create_publisher(Image, '/camera/image_filtered', 10)
+
+        # P7: 追踪物体可视化
+        self.tracked_objects_pub = self.create_publisher(
+            MarkerArray, '/tracked_objects', 10)
 
     # ========================================================================
     #  P1: 里程计回调 + 帧间位姿计算
@@ -103,7 +99,6 @@ class SemanticFilterNode(Node):
     def odom_callback(self, msg):
         """缓存最新的轮式里程计消息。"""
         self.latest_odom = msg
-        self.latest_odom_time = self.get_clock().now()
 
     def _init_camera_transform(self):
         """
@@ -169,97 +164,72 @@ class SemanticFilterNode(Node):
         """
         return np.linalg.inv(T_world_curr) @ T_world_prev
 
-    def _run_motion_detection(self, cv_img, cv_depth, semantic_mask_np, fx, fy, cx, cy):
+    def _run_motion_detection(self, cv_img, cv_depth, semantic_mask_np, fx, fy, cx, cy,
+                              T_world_cam=None):
         """
-        运动检测调度：多视图几何（主路径）→ LK+RANSAC（降级备份）。
+        P5: 深度聚类检测（世界坐标系 — 主检测器）。
 
-        返回: motion_mask_np (uint8, H×W)
+        P5 作为主力几何检测器，P6 仅在 P5 无法工作的特殊场景下降级启用。
+        不再使用 OR 融合——P6 的常驻运行是前两轮仿真大面积误检的来源。
+
+        参考:
+          DetectFusion (2019): 松耦合预处理层，世界坐标 ICP 聚类
+          DynaSLAM (2018): 多视图重投影前消除相机自运动
+          DS-SLAM (2018): 紧耦合 ORB-SLAM2 内做光流+极线（松耦合下无可比成功先例）
+
+        :return: (motion_mask, flow_mask, cluster_mask)
         """
-        current_time = self.get_clock().now()
-
-        # --- 判断里程计是否新鲜可用 ---
-        pose_stale = (
-            self.latest_odom is None or
-            self.latest_odom_time is None or
-            abs((current_time - self.latest_odom_time).nanoseconds * 1e-9) > self.pose_timeout
-        )
-
-        if pose_stale:
-            # 降级路径：里程计超时或不可用
-            if self.latest_odom is None:
-                self.get_logger().warn(
-                    '未收到 /odom 里程计数据，使用 LK+RANSAC 降级路径',
-                    throttle_duration_sec=10.0)
-            else:
-                self.get_logger().info(
-                    '里程计超时 (>100ms)，使用 LK+RANSAC 降级路径',
-                    throttle_duration_sec=10.0)
-            # 降级时也保持帧缓冲更新，避免多视图恢复时 prev_depth 过旧
-            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
-            self.motion_detector._store_frame(cv_img, cv_depth)
-            self.last_camera_pose = None  # 位姿不连续，重置多视图状态
-            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
-            return mask
-
-        # --- 主路径：多视图深度重投影 ---
-        # 将 /odom (base_footprint→odom) 与静态变换组合，得到相机真实位姿
-        T_world_base = self._odom_to_pose_matrix(self.latest_odom)
-        T_world_curr = T_world_base @ self.T_base_to_camera  # camera_link_optical 在世界帧的位姿
-
-        if self.last_camera_pose is None:
-            # 首帧：仅有里程计但无上一帧位姿 → 先缓冲帧，用 LK 出结果后再持久化位姿
-            motion_mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
-            self.motion_detector._store_frame(cv_img, cv_depth)
-            self.last_camera_pose = T_world_curr
-            return motion_mask
-
-        # 计算帧间相机运动
-        T_prev_to_curr = self._compute_relative_transform(
-            self.last_camera_pose, T_world_curr)
-
-        # 防御性检查：位姿矩阵形状必须为 (4,4)
-        if T_prev_to_curr.shape != (4, 4):
-            self.get_logger().error(
-                f'位姿矩阵形状异常: T_prev_to_curr.shape={T_prev_to_curr.shape}，'
-                f'降级到 LK+RANSAC', throttle_duration_sec=5.0)
-            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
-            self.motion_detector._store_frame(cv_img, cv_depth)
-            self.last_camera_pose = None
-            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
-            return mask
-
         camera_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+
+        # --- P5: 深度聚类检测（主检测器，世界坐标系）---
         try:
-            motion_mask, used_multiview = self.motion_detector.detect_multiview(
-                cv_img, cv_depth, semantic_mask_np, camera_intrinsics, T_prev_to_curr)
+            cluster_mask = self.motion_detector.detect_clustering(
+                cv_depth, camera_intrinsics, semantic_mask_np,
+                T_world_cam=T_world_cam)
         except Exception as e:
             self.get_logger().error(
-                f'多视图检测异常，降级到 LK+RANSAC: {e}',
+                f'P5 深度聚类检测异常，返回空掩码: {e}',
                 throttle_duration_sec=5.0)
-            mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
-            self.motion_detector._store_frame(cv_img, cv_depth)
-            self.last_camera_pose = None  # 多视图状态不一致，重置
-            self.motion_detector.dynamic_votes = None  # P3-①: 同步重置投票状态
-            return mask
+            cluster_mask = np.zeros(cv_depth.shape, dtype=np.uint8)
 
-        # 持久化当前帧位姿供下一帧使用
-        self.last_camera_pose = T_world_curr
-
-        if not used_multiview:
-            # detect_multiview 因首帧/无有效像素等原因未产出有效结果，降级到 LK
+        # --- P6: 光流检测（降级回退，仅在 P5 不可用时启用）---
+        # P6 设计为偶尔的降级检测器，不是常驻主检测器。
+        # 常驻运行会导致: 纯旋转→全帧误检, 白墙少特征→RANSAC不稳定,
+        # floodFill沿深度梯度蔓延→大面积假阳性。参考 DS-SLAM 的成功经验：
+        # 光流+极线仅在紧耦合 ORB-SLAM2（BA优化位姿+500+ORB特征）下可靠。
+        n_clusters = np.count_nonzero(cluster_mask)
+        flow_mask = np.zeros(cv_depth.shape, dtype=np.uint8)
+        if n_clusters < 300:  # P5 簇覆盖像素数不足（无足够深度簇时启用P6）
             try:
-                mask = self.motion_detector.detect(cv_img, cv_depth, semantic_mask_np)
+                flow_mask = self.motion_detector.detect(
+                    cv_img, cv_depth, semantic_mask_np)
             except Exception as e:
                 self.get_logger().error(
-                    f'LK+RANSAC 降级路径异常，返回空掩码: {e}',
+                    f'P6 光流检测异常: {e}',
                     throttle_duration_sec=5.0)
-                mask = np.zeros(cv_depth.shape, dtype=np.uint8)
-            self.motion_detector._store_frame(cv_img, cv_depth)
-            return mask
 
-        # 多视图成功：同步 LK 灰度缓冲（detect_multiview 不再更新 prev_gray）
-        self.motion_detector._store_frame(cv_img, cv_depth)
-        return motion_mask
+        # --- 融合: P5 主力 + P6 补充 ---
+        motion_mask = np.maximum(cluster_mask, flow_mask)
+
+        # --- 最小面积过滤 ---
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            motion_mask, connectivity=4)
+        for lbl in range(1, n_labels):
+            if stats[lbl, cv2.CC_STAT_AREA] < 200:  # <200px ≈ 非真实物体
+                motion_mask[labels == lbl] = 0
+
+        # 保持帧缓冲同步（光流检测的 prev_gray 需要连续帧）
+        try:
+            self.motion_detector._store_frame(cv_img, cv_depth)
+        except Exception as e:
+            self.get_logger().error(
+                f'帧缓冲更新异常，重置运动检测器状态: {e}',
+                throttle_duration_sec=5.0)
+            self.motion_detector.prev_gray = None
+            self.motion_detector.prev_pts = None
+            self.motion_detector.has_prev_frame = False
+
+        return motion_mask, flow_mask, cluster_mask
 
     def sync_callback(self, img_msg, depth_msg, info_msg):
         try:
@@ -268,218 +238,166 @@ class SemanticFilterNode(Node):
 
             cv_img = self.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
             cv_depth = self.cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-            debug_img = cv_img.copy()
 
-            results = self.model.track(
-                cv_img, classes=[0], conf=0.10, persist=True, 
-                tracker="botsort.yaml", verbose=False, retina_masks=True
+            # 预先计算相机→世界变换（一帧内不变，避免重复计算）
+            if self.latest_odom is not None:
+                T_wb = self._odom_to_pose_matrix(self.latest_odom)
+                T_world_cam = T_wb @ self.T_base_to_camera
+            else:
+                T_world_cam = np.eye(4, dtype=np.float64)
+
+            # 方案A: 统一检测 → 不依赖 Bot-SORT 追踪ID, 由 ObjectTracker 的匈牙利算法统一关联
+            results = self.model(
+                cv_img, classes=[0], conf=0.10,
+                verbose=False, retina_masks=True
             )
 
-            marker_array = MarkerArray()
-            
             h, w = cv_depth.shape
             semantic_mask_np = np.zeros((h, w), dtype=bool)
-            
-            # [新增] 获取当前帧存活的 track_ids，用于清理失效的历史轨迹
-            current_active_ids = set()
+            external_detections = []
 
             if results and len(results[0].boxes) > 0:
                 result = results[0]
-                
-                # 1. 动态深度剔除
+
+                # 1. 语义掩码提取（用于深度过滤 + P3-②膨胀保护带）
                 if result.masks is not None:
                     raw_mask = torch.any(result.masks.data, dim=0).cpu().numpy()
                     if raw_mask.shape != (h, w):
                         semantic_mask_np = cv2.resize(
-                            raw_mask.astype(np.uint8), 
+                            raw_mask.astype(np.uint8),
                             (w, h),
                             interpolation=cv2.INTER_NEAREST
                         ).astype(bool)
                     else:
                         semantic_mask_np = raw_mask
 
-                # 2. 3D 目标追踪映射（Kalman Filter 平滑）
-                if result.boxes.id is not None:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    track_ids = result.boxes.id.int().cpu().numpy()
-                    current_time = self.get_clock().now()
+                # 2. YOLO检测 → 统一追踪器外部检测格式（纯几何匈牙利关联，无Bot-SORT）
+                boxes = result.boxes.xyxy.cpu().numpy()
+                for i, box in enumerate(boxes):
+                    x1, y1, x2, y2 = map(int, box)
+                    x1c, y1c = max(0, x1), max(0, y1)
+                    x2c, y2c = min(w, x2), min(h, y2)
 
-                    for box, track_id in zip(boxes, track_ids):
-                        current_active_ids.add(track_id)
-                        x1, y1, x2, y2 = map(int, box)
+                    u = (x1 + x2) / 2.0
+                    v = (y1 + y2) / 2.0
 
-                        u = (x1 + x2) / 2.0
-                        v = (y1 + y2) / 2.0
+                    roi = cv_depth[y1c:y2c, x1c:x2c]
+                    if roi.size == 0 or np.all(np.isnan(roi)):
+                        continue
 
-                        roi = cv_depth[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                        if roi.size == 0 or np.all(np.isnan(roi)):
-                            continue
+                    Z = np.nanmedian(roi)
+                    if np.isnan(Z) or Z <= 0.1:
+                        continue
 
-                        Z = np.nanmedian(roi)
-                        if np.isnan(Z) or Z <= 0.1:
-                            continue
+                    # 相机坐标 → 世界坐标（复用预先计算的 T_world_cam）
+                    X_cam = (u - cx) * Z / fx
+                    Y_cam = (v - cy) * Z / fy
+                    P_cam = np.array([X_cam, Y_cam, Z, 1.0])
+                    P_world = T_world_cam @ P_cam
 
-                        X = (u - cx) * Z / fx
-                        Y = (v - cy) * Z / fy
-                        bbox_area = (x2 - x1) * (y2 - y1)
+                    # 实例掩码: bbox ∩ YOLO精细分割
+                    inst_mask = np.zeros((h, w), dtype=bool)
+                    inst_mask[y1c:y2c, x1c:x2c] = True
+                    if result.masks is not None:
+                        sm = result.masks.data[i].cpu().numpy()
+                        if sm.shape != (h, w):
+                            sm = cv2.resize(
+                                sm.astype(np.uint8), (w, h),
+                                interpolation=cv2.INTER_NEAREST
+                            ).astype(bool)
+                        inst_mask = inst_mask & sm.astype(bool)
 
-                        # --- KF 预测 + 更新 ---
-                        if track_id not in self.kf_pool:
-                            self.kf_pool[track_id] = KalmanFilter3D(
-                                track_id, (X, Y, Z), current_time)
+                    external_detections.append({
+                        'centroid_world': P_world[:3],
+                        'centroid_2d': (u, v),
+                        'bbox': (x1c, y1c, x2c - x1c, y2c - y1c),
+                        'area': (x2 - x1) * (y2 - y1),
+                        'depth_median': float(Z),
+                        'mask': inst_mask,
+                        'class_label': 'person',
+                    })
 
-                        kf = self.kf_pool[track_id]
-                        kf.predict(current_time=current_time)
-                        kf_smoothed = kf.update(
-                            (X, Y, Z), bbox_area=bbox_area, current_time=current_time)
-                        kf_x, kf_y, kf_z = float(kf_smoothed[0]), float(kf_smoothed[1]), float(kf_smoothed[2])
-
-                        # 轨迹历史：喂入 KF 平滑位置（用于 RViz 路径可视化）
-                        if track_id not in self.track_history:
-                            self.track_history[track_id] = []
-                        self.track_history[track_id].append((kf_x, kf_y, kf_z))
-                        if len(self.track_history[track_id]) > self.max_history_len:
-                            self.track_history[track_id].pop(0)
-
-                        # 构建 Marker（使用 KF 平滑位置替代原始观测）
-                        bbox_color = (0.0, 1.0, 0.0, 0.5)  # 绿色：正常
-                        if kf.state == TrackState.OCCLUDED:
-                            bbox_color = (1.0, 1.0, 0.0, 0.5)  # 黄色：遮挡
-
-                        bbox_marker = self.create_marker(
-                            header=img_msg.header, marker_type=Marker.CUBE,
-                            m_id=int(track_id), color=bbox_color, scale=(0.6, 0.6, 1.6),
-                            x=kf_x, y=kf_y, z=kf_z
-                        )
-                        text_marker = self.create_marker(
-                            header=img_msg.header, marker_type=Marker.TEXT_VIEW_FACING,
-                            m_id=int(track_id) + 1000, color=(1.0, 1.0, 1.0, 1.0),
-                            scale=(0.0, 0.0, 0.4),
-                            x=kf_x, y=kf_y, z=kf_z - 1.0, text=f"ID: {track_id}"
-                        )
-                        path_marker = self.create_path_marker(
-                            header=img_msg.header, track_id=int(track_id),
-                            history=self.track_history[track_id]
-                        )
-
-                        marker_array.markers.extend([bbox_marker, text_marker, path_marker])
-
-            # P2: 对当前帧未观测到的轨迹执行预测（遮挡处理）
             current_time = self.get_clock().now()
-            for track_id in list(self.kf_pool.keys()):
-                if track_id not in current_active_ids:
-                    kf = self.kf_pool[track_id]
-                    kf.predict(current_time=current_time)
-                    if kf.is_lost:
-                        # 长期丢失：清理 KF 和轨迹历史
-                        del self.kf_pool[track_id]
-                        if track_id in self.track_history:
-                            del self.track_history[track_id]
+            marker_array = MarkerArray()
 
-            # 3. 运动目标检测（多视图几何为主，LK+RANSAC 降级备份）
-            motion_mask_np = self._run_motion_detection(cv_img, cv_depth, semantic_mask_np,
-                                                         fx, fy, cx, cy)
+            # 3. 运动目标检测（P5 深度聚类 主检测器 + P6 光流 降级）
+            motion_mask_np, flow_mask_np, cluster_mask_np = self._run_motion_detection(
+                cv_img, cv_depth, semantic_mask_np, fx, fy, cx, cy,
+                T_world_cam=T_world_cam)
 
             # 4. 掩码并集融合
             final_mask = semantic_mask_np | (motion_mask_np > 0)
-            
-            cv_depth[final_mask] = np.nan
 
-            # F5: 三层渲染 —— 红=语义 蓝=运动 紫=重叠，不再互相覆盖
-            semantic_only = semantic_mask_np & ~(motion_mask_np > 0)
-            motion_only = (motion_mask_np > 0) & ~semantic_mask_np
-            overlap = semantic_mask_np & (motion_mask_np > 0)
-
-            debug_img[semantic_only] = [0, 0, 255]        # 纯红：仅语义检测
-            debug_img[motion_only] = [255, 0, 0]           # 纯蓝：仅运动检测
-            debug_img[overlap] = [255, 0, 255]             # 紫色：语义+运动重叠      
-
-            filtered_depth_msg = self.cv_bridge.cv2_to_imgmsg(cv_depth, encoding=depth_msg.encoding)
-            filtered_depth_msg.header = depth_msg.header
-            self.depth_pub.publish(filtered_depth_msg)
-
-            # P4: RGB域动态过滤 — 动态区域涂黑，阻止RTAB-Map在动态物体上提取ORB特征
-            # DYR-SLAM 参照: "all RGB images and depth images that remove dynamic
-            # objects are transmitted to the RTAB-Map system"
-            rgb_filtered = cv_img.copy()
-            rgb_filtered[final_mask] = 0  # 动态像素→黑色(无纹理→无ORB特征)
-            rgb_filtered_msg = self.cv_bridge.cv2_to_imgmsg(rgb_filtered, encoding='bgr8')
-            rgb_filtered_msg.header = img_msg.header
-            self.rgb_filtered_pub.publish(rgb_filtered_msg)
+            # ================================================================
+            #  Debug 可视化 + 发布（在 P7 之前，确保 P7 异常时也能看到检测结果）
+            #  四色: 红=语义 蓝=聚类(P5) 绿=光流(P6) 青=聚类∩光流 品红=语义∩运动
+            # ================================================================
+            cluster_bool = cluster_mask_np > 0
+            flow_bool = flow_mask_np > 0
+            debug_img = cv_img.copy()
+            debug_img[cluster_bool & ~flow_bool & ~semantic_mask_np] = [255, 0, 0]       # 仅聚类: 蓝
+            debug_img[flow_bool & ~cluster_bool & ~semantic_mask_np] = [0, 255, 0]       # 仅光流: 绿
+            debug_img[cluster_bool & flow_bool & ~semantic_mask_np] = [255, 255, 0]      # 聚类∩光流: 青
+            debug_img[semantic_mask_np & ~cluster_bool & ~flow_bool] = [0, 0, 255]       # 仅语义: 红
+            debug_img[semantic_mask_np & (cluster_bool | flow_bool)] = [255, 0, 255]     # 语义∩运动: 品红
 
             debug_msg = self.cv_bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
             debug_msg.header = img_msg.header
             self.debug_pub.publish(debug_msg)
 
-            # P3-③: 独立 debug topic — 三个掩码分量分开发布
-            semantic_msg = self.cv_bridge.cv2_to_imgmsg(
-                semantic_mask_np.astype(np.uint8) * 255, encoding='mono8')
-            semantic_msg.header = img_msg.header
-            self.semantic_debug_pub.publish(semantic_msg)
-
-            motion_msg = self.cv_bridge.cv2_to_imgmsg(motion_mask_np, encoding='mono8')
-            motion_msg.header = img_msg.header
-            self.motion_debug_pub.publish(motion_msg)
-
             final_mask_uint8 = final_mask.astype(np.uint8) * 255
             final_msg = self.cv_bridge.cv2_to_imgmsg(final_mask_uint8, encoding='mono8')
             final_msg.header = img_msg.header
             self.final_debug_pub.publish(final_msg)
-            
+
+            # ================================================================
+            #  P7: 统一物体追踪（匈牙利+Kalman，行人+箱子统一流水线）
+            #  追踪失败不应该阻断过滤输出——RTAB-Map依赖数据连续
+            # ================================================================
+            camera_intrinsics = {'fx': fx, 'fy': fy, 'cx': cx, 'cy': cy}
+
+            feedback_mask = np.zeros((h, w), dtype=np.uint8)
+            tracked_objects = []
+            obj_markers = []
+            try:
+                feedback_mask, tracked_objects, obj_markers = self.object_tracker.update(
+                    motion_mask_np, cv_depth, camera_intrinsics,
+                    img_msg.header, current_time, T_world_cam=T_world_cam,
+                    external_detections=external_detections)
+            except Exception as e:
+                self.get_logger().error(
+                    f'P7 追踪异常，跳过本帧追踪（不影响过滤输出）: {e}',
+                    throttle_duration_sec=2.0)
+
+            if feedback_mask.any():
+                final_mask = final_mask | (feedback_mask > 0)
+
+            # ================================================================
+            #  深度域 + RGB 域动态过滤 → RTAB-Map 松耦合输入
+            # ================================================================
+            marker_array.markers.extend(obj_markers)
+            if tracked_objects:
+                tracked_msg = MarkerArray()
+                tracked_msg.markers = obj_markers
+                self.tracked_objects_pub.publish(tracked_msg)
+
+            cv_depth[final_mask] = np.nan
+            filtered_depth_msg = self.cv_bridge.cv2_to_imgmsg(cv_depth, encoding=depth_msg.encoding)
+            filtered_depth_msg.header = depth_msg.header
+            self.depth_pub.publish(filtered_depth_msg)
+
+            rgb_filtered = cv_img.copy()
+            rgb_filtered[final_mask] = 0
+            rgb_filtered_msg = self.cv_bridge.cv2_to_imgmsg(rgb_filtered, encoding='bgr8')
+            rgb_filtered_msg.header = img_msg.header
+            self.rgb_filtered_pub.publish(rgb_filtered_msg)
+
             self.track_pub.publish(marker_array)
 
         except Exception as e:
             import traceback
             self.get_logger().error(f'Processing Error: {e}')
             self.get_logger().error(f'Traceback:\n{traceback.format_exc()}')
-
-    def create_marker(self, header, marker_type, m_id, color, scale, x, y, z, text=""):
-        """Marker 辅助生成函数"""
-        m = Marker()
-        m.header = header
-        m.ns = "pedestrians"
-        m.id = m_id
-        m.type = marker_type
-        m.action = Marker.ADD
-        m.pose.position.x = float(x)
-        m.pose.position.y = float(y)
-        m.pose.position.z = float(z)
-        m.pose.orientation.w = 1.0 
-        m.scale.x, m.scale.y, m.scale.z = scale
-        m.color.r, m.color.g, m.color.b, m.color.a = color
-        if text: m.text = text
-        m.lifetime.sec = 0
-        m.lifetime.nanosec = 200000000 
-        return m
-
-    # [新增] 专门用于绘制轨迹的辅助函数
-    def create_path_marker(self, header, track_id, history):
-        m = Marker()
-        m.header = header
-        m.ns = "pedestrian_paths"
-        m.id = track_id + 2000  # 偏移 ID 空间避免与 Bbox 和 Text 冲突
-        m.type = Marker.LINE_STRIP # 设定为连续线段格式
-        m.action = Marker.ADD
-        
-        m.scale.x = 0.05 # 轨迹线条的粗细
-        
-        # 轨迹颜色设定：黄色半透明
-        m.color.r = 1.0
-        m.color.g = 1.0
-        m.color.b = 0.0
-        m.color.a = 0.8 
-        
-        # 将历史坐标点组装进线条数组
-        for pt in history:
-            p = Point()
-            p.x = float(pt[0])
-            p.y = float(pt[1])
-            p.z = float(pt[2] - 0.7) # Z减去0.7是让轨迹线贴在行人的脚底位置，更符合视觉直觉
-            m.points.append(p)
-            
-        m.lifetime.sec = 0
-        m.lifetime.nanosec = 200000000
-        return m
 
 def main(args=None):
     rclpy.init(args=args)

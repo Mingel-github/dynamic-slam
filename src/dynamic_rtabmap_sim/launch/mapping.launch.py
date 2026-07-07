@@ -50,30 +50,27 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             'frame_id': 'base_footprint',           
             'subscribe_depth': 'true',              
-            'subscribe_scan': 'false',              
-            'subscribe_scan_cloud': 'true',         
-            'visual_odometry': 'false',             
-            'odom_topic': '/odom',                  
-            
-            'rgb_topic': '/camera/image_filtered',  # P4: 订阅过滤后RGB，阻止动态物体上的ORB特征
+            'subscribe_scan': 'false',
+            'subscribe_scan_cloud': 'false',        # 纯RGB-D管线（学术公平对比）
+            'visual_odometry': 'false',
+            'odom_topic': '/odom',
+
+            'rgb_topic': '/camera/image_filtered',  # 过滤后RGB，阻断动态物体ORB特征
             'depth_topic': '/camera/depth/image_filtered',
             'camera_info_topic': '/camera/camera_info',
-            'scan_cloud_topic': '/points_raw',      
-            
+
             'qos': qos,
-            'queue_size': '20',                     
-            'approx_sync': 'true',                  
-            
+            'queue_size': '20',
+            'approx_sync': 'true',
+
             # ==========================================================
-            # 【终极形态：视觉 + 雷达ICP 深度融合】
-            # 包含：
-            # 1. g2o优化器与忽略0误差 (Strategy 1, VarianceIgnored true)
-            # 2. 严格的视觉门槛 (MinInliers 25)
-            # 3. 放宽拉扯限制，因为有雷达护航 (OptimizeMaxError 2.0)
-            # 4. 开启雷达空间回环 (ProximityBySpace true)
-            # 5. 开启 视觉+ICP 联合匹配机制 (Reg/Strategy 2)
+            # 纯视觉 RGB-D SLAM（对标 DynaSLAM/DS-SLAM）
+            # g2o优化器 + DetectionRate 5Hz + 严格视觉门槛(MinInliers 25)
             # ==========================================================
-            'args': '--delete_db_on_start --Grid/RangeMax 5.0 --Grid/RayTracing true --Optimizer/Strategy 1 --Optimizer/VarianceIgnored true --Vis/MinInliers 25 --RGBD/OptimizeMaxError 2.0 --RGBD/ProximityBySpace true --Reg/Strategy 2',
+            'args': '--delete_db_on_start --Grid/RangeMax 5.0 --Grid/RayTracing true '
+                    '--Optimizer/Strategy 1 --Optimizer/VarianceIgnored true '
+                    '--Vis/MinInliers 25 --RGBD/ProximityBySpace true '
+                    '--Rtabmap/DetectionRate 5.0',
             
             # 打破 Gazebo 的绝对自信
             'odom_tf_linear_variance': '0.001',
